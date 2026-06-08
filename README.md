@@ -154,7 +154,8 @@ class UltimateShipAnalyzer(QMainWindow):
         gen_vbox = QVBoxLayout(gen_box)
         gen_vbox.addWidget(QLabel("<b>[General Settings]</b>"))
         for lbl, attr, dval in [("Scale:", "txt_scale", "100"), ("H-Ext (mm):", "txt_ext", "10"),
-                                ("V-Ext (mm):", "txt_perp", "10")]:
+                                ("V-Ext (mm):", "txt_perp", "10"),
+                                ("Shear Force(V):", "txt_shear", "")]:
             h = QHBoxLayout()
             h.addWidget(QLabel(lbl))
             h.addStretch()
@@ -1336,6 +1337,23 @@ class UltimateShipAnalyzer(QMainWindow):
                 self.calc_na_bl = na_y
                 self.calc_ixx = ixxm
 
+                for edge in self.graph_edges:
+                    geom = edge['geometry']
+                    area = geom.length * edge['thickness']
+
+                    # 선분의 중심 좌표
+                    x_mid = (geom.coords[0][0] + geom.coords[-1][0]) / 2.0
+                    y_mid = (geom.coords[0][1] + geom.coords[-1][1]) / 2.0
+
+                    # 도심(Centroid) 기준 거리 (self.cx는 전체 도심 X, self.calc_na_bl은 도심 Y)
+                    lever_arm_z = y_mid - self.calc_na_bl  # 수식(3)의 (y - yc)
+                    lever_arm_y = x_mid - self.cx  # 수식(2)의 (z - zc)
+
+                    # 수식 (2), (3): 각 축에 대한 면적 모멘트 (Area * Lever Arm)
+                    edge['delta_Sz'] = area * lever_arm_z
+                    edge['delta_Sy'] = area * lever_arm_y
+
+
                 calc_result_text = (
                     f"\n\n📊 [Section Properties Result]\n"
                     f"----------------------------------------\n"
@@ -1551,6 +1569,20 @@ class UltimateShipAnalyzer(QMainWindow):
                 deg[e['v']] = deg.get(e['v'], 0) + 1
             return deg
 
+            # VM (Visited Members): 선분 방문 여부 (0: 미방문, 1: 방문)
+            self.VM = {edge['id']: 0 for edge in self.graph_edges}
+
+            # MN (Visited Nodes): 노드 방문 여부 (0: 미방문, 1: 방문)
+            self.MN = {nid: 0 for nid in self.graph_nodes.keys()}
+
+            # ✨ [신규 추가] 3. 노드별 전단 흐름(Q) 초기화 및 Free Node Q=0 설정
+            self.node_q = {nid: 0.0 for nid in self.graph_nodes.keys()}
+
+            initial_degrees = get_degrees(working_edges)
+            for nid, degree in initial_degrees.items():
+                if degree == 1:  # Degree가 1인 노드 (자유 노드)
+                    self.node_q[nid] = 0.0  # Q = 0 설정
+
         while True:
             # ---------------------------------------------------------
             # [Phase 1: 좌측 순서도] 자유 노드 가지치기 (Prune Free Nodes)
@@ -1634,6 +1666,143 @@ class UltimateShipAnalyzer(QMainWindow):
 
         self.flowchart_slit_nodes = list(set(slit_nodes_ids))
 
+    def calculate_determinate_shear_flow(self):
+        """수식 (1)~(3) 및 Flowchart 기반 정정 전단 흐름 계산"""
+
+        # ---------------------------------------------------------
+        # [수식 변수 준비] 수식 (1)의 계수들
+        # ---------------------------------------------------------
+        # UI에서 입력받은 전단력 (단위 변환 고려)
+        Vy = float(self.txt_shear.text()) if hasattr(self, 'txt_shear') and self.txt_shear.text() else 1000.0
+        Vz = 0.0  # 수평 전단력이 필요한 경우 추가 가능
+
+        # 물성치 매핑 (도면 z축 -> 코드 x축 / 도면 y축 -> 코드 y축)
+        Izz = getattr(self, 'calc_ixx', 1e12) * 2.0  # Ixx
+        Iyy = getattr(self, 'calc_iyy', 1e12) * 2.0  # Iyy (사전 계산 필요)
+        Iyz = getattr(self, 'calc_ixy', 0.0) * 2.0  # Ixy (비대칭 고려 시 필요)
+
+        denom = (Iyy * Izz) - (Iyz ** 2)
+        if denom == 0: denom = 1e-9  # ZeroDivision 방지
+
+        # ---------------------------------------------------------
+        # [알고리즘 변수 준비] 순서도 블록 1 대응
+        # ---------------------------------------------------------
+        nm = {nid: 0 for nid in self.graph_nodes}
+        adj = {nid: [] for nid in self.graph_nodes}
+
+        for e in self.graph_edges:
+            adj[e['start_node']].append(e['id'])
+            adj[e['end_node']].append(e['id'])
+            nm[e['start_node']] += 1
+            nm[e['end_node']] += 1
+
+        vn = {nid: 0 for nid in self.graph_nodes}
+        vm = {e['id']: 0 for e in self.graph_edges}
+
+        # Superposition(중첩)을 위한 노드 유입/유출 q값 저장소
+        flow_into_node = {nid: 0.0 for nid in self.graph_nodes}
+        q_out_from_node = {nid: 0.0 for nid in self.graph_nodes}
+        self.edge_q_results = {}  # 최종 부재별 전단 흐름 결과
+
+        # ---------------------------------------------------------
+        # 내부 함수: 수식 (1) 적용
+        # ---------------------------------------------------------
+        def calculate_dq(edge, start_nid):
+            # 벡터 방향성 판별 (탐색 방향과 선분 정의 방향 일치 여부)
+            dir_sign = 1 if edge['start_node'] == start_nid else -1
+
+            dSz = dir_sign * edge.get('delta_Sz', 0.0)
+            dSy = dir_sign * edge.get('delta_Sy', 0.0)
+
+            # 수식 (1) 원형 엄격 적용
+            term1 = ((Vy * Iyy - Vz * Iyz) / denom) * dSz
+            term2 = ((Vz * Izz - Vy * Iyz) / denom) * dSy
+
+            return -(term1 + term2)
+
+        # ---------------------------------------------------------
+        # [순회 로직 메인 루프] 순서도의 마름모 조건 완벽 대응
+        # ---------------------------------------------------------
+        while True:
+            # 마름모 1: "Is there any unvisited free node remaining?"
+            unvisited_free = [nid for nid in self.graph_nodes if vn[nid] == 0 and nm[nid] == 1]
+
+            if unvisited_free:
+                # YES 방향 경로
+                i = unvisited_free[0]
+                vn[i] += 1
+                q_out_from_node[i] = 0.0  # Determinate shear flow is 0
+
+                while True:
+                    unvisited_members = [eid for eid in adj[i] if vm[eid] == 0]
+                    if not unvisited_members: break
+                    m = unvisited_members[0]
+                    edge = self.graph_edges[m]
+
+                    # Go from node 'i' to remaining node 'j'
+                    j = edge['end_node'] if edge['start_node'] == i else edge['start_node']
+
+                    # Calculate determinate shear flow q_d(j)
+                    dq = calculate_dq(edge, i)
+                    q_end = q_out_from_node[i] + dq
+                    flow_into_node[j] += q_end  # 들어오는 흐름 합산 (Superposition 준비)
+
+                    self.edge_q_results[m] = {'q_start': q_out_from_node[i], 'q_end': q_end, 'node_from': i,
+                                              'node_to': j}
+
+                    # Assign visits
+                    vm[m] += 1
+                    vn[j] += 1
+                    i = j
+
+                    # 경로 지속/중단 판별
+                    if nm[i] == 1:
+                        break  # Is node 'i' a free node? -> YES -> End Path
+                    elif nm[i] >= 3:
+                        break  # Is node 'i' a bridge node? -> YES -> Stop path
+                    else:
+                        # 통과 노드(단순 연결)는 들어온 값이 그대로 나감
+                        q_out_from_node[i] = flow_into_node[i]
+
+            else:
+                # NO 방향 경로 -> 마름모 2: "Is there an unvisited member with node 'i' such that vn(i) = nm(i) - 1?"
+                bridge_candidates = [nid for nid in self.graph_nodes if vn[nid] == nm[nid] - 1]
+                valid_bridges = [nid for nid in bridge_candidates if any(vm[eid] == 0 for eid in adj[nid])]
+
+                if not valid_bridges:
+                    break  # NO -> END (전체 알고리즘 종료)
+
+                # YES -> Start a new path at this node
+                i = valid_bridges[0]
+                vn[i] += 1
+
+                # 핵심: Superposition of all shear flows flowing INTO the node
+                q_out_from_node[i] = flow_into_node[i]
+
+                while True:
+                    unvisited_members = [eid for eid in adj[i] if vm[eid] == 0]
+                    if not unvisited_members: break
+                    m = unvisited_members[0]
+                    edge = self.graph_edges[m]
+
+                    j = edge['end_node'] if edge['start_node'] == i else edge['start_node']
+
+                    dq = calculate_dq(edge, i)
+                    q_end = q_out_from_node[i] + dq
+                    flow_into_node[j] += q_end
+
+                    self.edge_q_results[m] = {'q_start': q_out_from_node[i], 'q_end': q_end, 'node_from': i,
+                                              'node_to': j}
+
+                    vm[m] += 1
+                    vn[j] += 1
+                    i = j
+
+                    if nm[i] == 1 or nm[i] >= 3:
+                        break
+                    else:
+                        q_out_from_node[i] = flow_into_node[i]
+
     def on_edge_click(self, event):
         """그래프 선분 클릭 시 정보를 표시하는 이벤트 핸들러"""
         if event.artist and hasattr(event.artist, 'get_gid'):
@@ -1642,13 +1811,17 @@ class UltimateShipAnalyzer(QMainWindow):
                 edge_id = int(str(gid).split("_")[1])
                 edge = self.graph_edges[edge_id]
 
+                length_m = edge['length'] / 1000.0  # mm -> m 변환
+                delta_S_m3 = edge['delta_S'] / 1e9  # mm³ -> m³ 변환
+
                 info_text = (
                     f"🔹 [선분 상세 정보]\n\n"
                     f" - 부재 타입 : {edge['type']}\n"
                     f" - 시작 노드 : Node {edge['start_node']} (X: {edge['start_coord'][0]:.1f}, Y: {edge['start_coord'][1]:.1f})\n"
                     f" - 끝 노드   : Node {edge['end_node']} (X: {edge['end_coord'][0]:.1f}, Y: {edge['end_coord'][1]:.1f})\n"
                     f" - 두께(t)   : {edge['thickness']} mm\n"
-                    f" - 길이(L)   : {edge['length']:,.2f} mm"
+                    f" - 길이(L)   : {length_m:,.3f} m\n"  # ✨ 단위 m로 표시
+                    f" - 1차 모멘트(ΔS) : {delta_S_m3:,.5f} m³"  # ✨ 단위 m³로 표시 (소수점 5자리)
                 )
                 from PySide6.QtWidgets import QMessageBox
                 QMessageBox.information(self, f"Edge ID: {edge_id}", info_text)
