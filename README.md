@@ -1,1 +1,1800 @@
-# QDQD
+import sys
+import os
+import io
+import traceback
+import datetime
+import colorsys
+import numpy as np
+import pandas as pd
+import ezdxf
+import matplotlib
+import matplotlib.pyplot as plt
+import pdfplumber
+import re
+
+import progress
+from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas, \
+    NavigationToolbar2QT as NavigationToolbar
+from matplotlib.figure import Figure
+from matplotlib import rcParams, cm
+from matplotlib.ticker import FuncFormatter
+
+from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
+                               QPushButton, QLabel, QTextEdit, QFileDialog, QLineEdit,
+                               QHBoxLayout, QScrollArea, QFrame, QSplitter, QComboBox,
+                               QInputDialog, QMessageBox, QProgressDialog, QRadioButton)
+from PySide6.QtGui import QTextCursor, QIcon
+from PySide6.QtCore import Qt
+
+from shapely.geometry import LineString, Polygon, Point, box
+from shapely.ops import unary_union, polygonize, split, nearest_points, snap
+import shapely.affinity as affinity
+from shapely.strtree import STRtree
+from collections import defaultdict, deque
+
+matplotlib.use('QtAgg')
+rcParams['font.family'] = 'Malgun Gothic'
+rcParams['axes.unicode_minus'] = False
+
+
+class UltimateShipAnalyzer(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("HHI-FAIVE - Floating Automated Integrity Verification and Evaluation")
+        self.setWindowIcon(QIcon('icon.ico'))
+        self.resize(1800, 1000)
+        self.current_dxf_path = ""
+        self.is_processing = False
+        self.reset_analysis_data()
+        self.init_ui()
+
+    def reset_analysis_data(self):
+        self.raw_1999_lines = []
+        self.left_1999_segments = []
+        self.lines_1102 = []
+        self.lines_1102_raw = []
+        self.lines_157 = []
+
+        # ✨ 새로 추가할 6001~9001 레이어 변수
+        self.lines_6001 = []
+        self.lines_7001 = []
+        self.lines_8001 = []
+        self.lines_9001 = []
+
+        self.hull_centroid = Point(0, 0)
+        self.is_calculated = False
+
+        self.aligned_internal = []
+        self.final_healed_centerlines = []
+
+        self.analysis_nodes = []  # 유효 노드 리스트
+        self.analysis_elements = []  # 유효 1D 요소(부재) 리스트
+
+        self.graph_nodes = {}
+        self.graph_edges = []
+        self.graph_summary = ""
+
+        self.flowchart_slit_nodes = []
+
+    def init_ui(self):
+        self.setStyleSheet("""
+            QWidget {
+                font-family: 'Malgun Gothic', 'Noto Sans KR', sans-serif;
+                font-size: 12px;
+                color: #2C3E50;
+            }
+            QLineEdit, QComboBox {
+                background-color: #FFFFFF;
+                color: #2C3E50;
+                border: 1px solid #CED4DA;
+                border-radius: 4px;
+                padding: 2px 5px;
+                min-height: 22px;
+            }
+            QLineEdit:focus, QComboBox:focus {
+                border: 1.5px solid #00AD1D;
+            }
+            QFrame#settingBox {
+                background-color: #F8F9FA;
+                border: 1px solid #E9ECEF;
+                border-radius: 6px;
+                padding: 5px;
+                margin-top: 5px;
+            }
+            QLabel {
+                border: none;
+                background: transparent;
+            }
+            QPushButton {
+                font-family: 'Malgun Gothic';
+                font-weight: bold;
+                font-size: 13px;
+                border-radius: 5px;
+                padding: 2px;
+                margin-top: 5px;
+                margin-bottom: 5px;
+            }
+            QPushButton#btnGreen {
+                background-color: #00AD1D;
+                color: white;
+            }
+            QPushButton#btnGreen:hover {
+                background-color: #009619;
+            }
+            QPushButton#btnGreen:disabled {
+                background-color: #A5D6A7;
+                color: #F1F8E9;
+                border: none;
+            }
+            QTextEdit#resultBox {
+                font-family: 'Consolas', monospace;
+                font-size: 13px;
+                background-color: #FDFEFE;
+                border: 1px solid #CED4DA;
+                border-radius: 2px;
+                padding: 5px;
+            }
+        """)
+
+        main_scroll = QScrollArea()
+        main_scroll.setWidgetResizable(True)
+        main_container = QWidget()
+        main_layout = QHBoxLayout(main_container)
+
+        self.field_width = 100
+
+        control_panel = QWidget()
+        control_panel.setFixedWidth(300)
+        control_panel_layout = QVBoxLayout(control_panel)
+        control_panel_layout.setAlignment(Qt.AlignTop)
+
+        # [General Settings]
+        gen_box = QFrame()
+        gen_box.setObjectName("settingBox")
+        gen_vbox = QVBoxLayout(gen_box)
+        gen_vbox.addWidget(QLabel("<b>[General Settings]</b>"))
+        for lbl, attr, dval in [("Scale:", "txt_scale", "100"), ("H-Ext (mm):", "txt_ext", "10"),
+                                ("V-Ext (mm):", "txt_perp", "10")]:
+            h = QHBoxLayout()
+            h.addWidget(QLabel(lbl))
+            h.addStretch()
+            le = QLineEdit(dval)
+            le.setFixedWidth(self.field_width)
+            setattr(self, attr, le)
+            h.addWidget(le)
+            gen_vbox.addLayout(h)
+        control_panel_layout.addWidget(gen_box)
+
+        self.btn_load = QPushButton("1. DXF Load 📂")
+        self.btn_load.setFixedHeight(40)
+        self.btn_load.setObjectName("btnGreen")
+        self.btn_load.clicked.connect(self.load_and_process_dxf)
+        control_panel_layout.addWidget(self.btn_load)
+
+        self.btn_calc = QPushButton("2. 1D 변환 및 정렬 📐")
+        self.btn_calc.setFixedHeight(40)
+        self.btn_calc.setObjectName("btnGreen")
+        self.btn_calc.clicked.connect(self.process_1d_geometry)
+        control_panel_layout.addWidget(self.btn_calc)
+
+        control_panel_layout.addStretch()
+
+        main_layout.addWidget(control_panel)
+
+        # ---------------------------------------------------------
+        # 작업 영역 (렌더링 및 출력)
+        # ---------------------------------------------------------
+        work_area = QWidget()
+        work_layout = QVBoxLayout(work_area)
+        viz_splitter = QSplitter(Qt.Horizontal)
+
+        # 뷰포트 타이틀 변경
+        for i, title in enumerate(["[Final Healed 1D Geometry]", "[Graphified Hull Cross-Section]"]):
+            container = QWidget()
+            lay = QVBoxLayout(container)
+            lay.addWidget(QLabel(f"<b>{title}</b>"))
+            fig = Figure()
+            can = FigureCanvas(fig)
+            lay.addWidget(NavigationToolbar(can, self))
+            lay.addWidget(can, stretch=1)
+            setattr(self, f"fig{i + 1}", fig)
+            setattr(self, f"can{i + 1}", can)
+            viz_splitter.addWidget(container)
+
+            # ✨ 두 번째 캔버스(그래프 뷰)에 클릭 이벤트 핸들러 연결
+            if i == 1:
+                can.mpl_connect('pick_event', self.on_edge_click)
+
+        work_layout.addWidget(viz_splitter, stretch=7)
+
+        self.result_box = QTextEdit()
+        self.result_box.setObjectName("resultBox")
+        self.result_box.setReadOnly(True)
+        self.result_box.setFixedHeight(200)
+        work_layout.addWidget(self.result_box)
+        main_layout.addWidget(work_area, stretch=7)
+
+        main_scroll.setWidget(main_container)
+        self.setCentralWidget(main_scroll)
+
+    # =====================================================================
+    # 부재 판단 및 그룹/정렬 메서드
+    # =====================================================================
+    def group_and_align_centerlines(self, centerlines, tol_dist=150.0, tol_angle=1.5):
+        v_lines, h_lines, d_lines = [], [], []
+
+        # 1. 수평(H), 수직(V), 대각선(D) 엄격한 분류
+        for cl in centerlines:
+            coords = list(cl['line'].coords)
+            max_seg_len = 0
+            best_angle = 0
+            total_len = 0
+
+            for i in range(len(coords) - 1):
+                p1, p2 = np.array(coords[i]), np.array(coords[i + 1])
+                v = p2 - p1
+                length = np.linalg.norm(v)
+                total_len += length
+
+                if length > max_seg_len:
+                    max_seg_len = length
+                    best_angle = np.degrees(np.arctan2(v[1], v[0])) % 180
+
+            if total_len < 1e-6: continue
+            cl_info = {'cl': cl, 'length': total_len, 'coords': coords, 'angle': best_angle}
+
+            if best_angle <= tol_angle or best_angle >= 180 - tol_angle:
+                h_lines.append(cl_info)
+            elif 90 - tol_angle <= best_angle <= 90 + tol_angle:
+                v_lines.append(cl_info)
+            else:
+                d_lines.append(cl_info)
+
+        import colorsys
+        aligned_centerlines = []
+
+        # 2. 수직 부재(V) 그룹화 및 정렬
+        v_groups = []
+        for info in v_lines:
+            mid_x = (info['coords'][0][0] + info['coords'][-1][0]) / 2.0
+            placed = False
+            for g in v_groups:
+                if abs(g['avg_x'] - mid_x) < tol_dist:
+                    g['members'].append(info)
+                    tot_len = sum(m['length'] for m in g['members'])
+                    g['avg_x'] = sum(
+                        ((m['coords'][0][0] + m['coords'][-1][0]) / 2.0) * m['length'] for m in g['members']) / tot_len
+                    placed = True
+                    break
+            if not placed:
+                v_groups.append(
+                    {'avg_x': mid_x, 'members': [info], 'color': colorsys.hsv_to_rgb(np.random.rand(), 0.8, 0.9)})
+
+        for g in v_groups:
+            avg_x = g['avg_x']
+            for m in g['members']:
+                new_coords = [(avg_x, p[1]) for p in m['coords']]
+                m['cl']['line'] = LineString(new_coords)
+                m['cl']['color'] = g['color']
+                aligned_centerlines.append(m['cl'])
+
+        # 3. 수평 부재(H) 그룹화 및 정렬
+        h_groups = []
+        for info in h_lines:
+            mid_y = (info['coords'][0][1] + info['coords'][-1][1]) / 2.0
+            placed = False
+            for g in h_groups:
+                if abs(g['avg_y'] - mid_y) < tol_dist:
+                    g['members'].append(info)
+                    tot_len = sum(m['length'] for m in g['members'])
+                    g['avg_y'] = sum(
+                        ((m['coords'][0][1] + m['coords'][-1][1]) / 2.0) * m['length'] for m in g['members']) / tot_len
+                    placed = True
+                    break
+            if not placed:
+                h_groups.append(
+                    {'avg_y': mid_y, 'members': [info], 'color': colorsys.hsv_to_rgb(np.random.rand(), 0.8, 0.9)})
+
+        for g in h_groups:
+            avg_y = g['avg_y']
+            for m in g['members']:
+                new_coords = [(p[0], avg_y) for p in m['coords']]
+                m['cl']['line'] = LineString(new_coords)
+                m['cl']['color'] = g['color']
+                aligned_centerlines.append(m['cl'])
+
+        # ✨ 4. 대각선 부재(D) 그룹화 (각도와 원점 거리를 이용한 직선 방정식 기반)
+        d_groups = []
+        for info in d_lines:
+            p1 = np.array(info['coords'][0])
+            ang = info['angle']
+            th = np.radians(ang)
+            # 원점에서 직선까지의 수직 거리 (rho)
+            rho = -p1[0] * np.sin(th) + p1[1] * np.cos(th)
+
+            placed = False
+            for g in d_groups:
+                # 각도 오차 및 수직 거리(평행 간격) 오차 확인
+                ang_diff = min(abs(g['avg_angle'] - ang), 180 - abs(g['avg_angle'] - ang))
+                if ang_diff < tol_angle and abs(g['avg_rho'] - rho) < tol_dist:
+                    g['members'].append(info)
+                    tot_len = sum(m['length'] for m in g['members'])
+                    # 각도 가중 평균 갱신
+                    g['avg_angle'] = sum(m['angle'] * m['length'] for m in g['members']) / tot_len
+
+                    # 갱신된 각도로 그룹의 평균 rho 재계산
+                    avg_th = np.radians(g['avg_angle'])
+                    new_rho_sum = 0
+                    for m in g['members']:
+                        mp1 = np.array(m['coords'][0])
+                        m_rho = -mp1[0] * np.sin(avg_th) + mp1[1] * np.cos(avg_th)
+                        new_rho_sum += m_rho * m['length']
+                    g['avg_rho'] = new_rho_sum / tot_len
+
+                    placed = True
+                    break
+
+            if not placed:
+                d_groups.append({
+                    'avg_angle': ang,
+                    'avg_rho': rho,
+                    'members': [info],
+                    'color': colorsys.hsv_to_rgb(np.random.rand(), 0.8, 0.9)  # 그룹별 색상 부여
+                })
+
+        # ✨ 5. 대각선 부재 정렬 (계산된 평균 직선 위로 좌표 투영/Projection)
+        for g in d_groups:
+            th = np.radians(g['avg_angle'])
+            rho = g['avg_rho']
+
+            # 직선의 방향 벡터와 기준점
+            dir_v = np.array([np.cos(th), np.sin(th)])
+            p0 = np.array([-rho * np.sin(th), rho * np.cos(th)])
+
+            for m in g['members']:
+                new_coords = []
+                for p in m['coords']:
+                    pt = np.array(p)
+                    # 현재 점을 평균 직선 위로 직교 투영(Orthogonal Projection)
+                    t = np.dot(pt - p0, dir_v)
+                    proj_pt = p0 + t * dir_v
+                    new_coords.append(tuple(proj_pt))
+
+                m['cl']['line'] = LineString(new_coords)
+                m['cl']['color'] = g['color']
+                aligned_centerlines.append(m['cl'])
+
+        return aligned_centerlines
+
+    # =====================================================================
+    # 유틸리티 메서드
+    # =====================================================================
+    def _extract_pts(self, e, scale):
+        try:
+            if e.dxftype() == 'LINE':
+                return [(e.dxf.start.x * scale, e.dxf.start.y * scale), (e.dxf.end.x * scale, e.dxf.end.y * scale)]
+            elif e.dxftype() in ('LWPOLYLINE', 'POLYLINE'):
+                return [(p[0] * scale, p[1] * scale) for p in e.get_points()]
+        except:
+            return None
+        return None
+
+    def heal_internal_collinear(self, lines, threshold_gap=150.0):
+        """내부 부재(1102, 157 등)에 대해 150mm 이내의 동일 선상 틈새를 이어주는 함수"""
+        if not lines: return []
+        bridges = []
+        groups = {}
+        for l in lines:
+            c = list(l.coords)
+            p1, p2 = np.array(c[0]), np.array(c[-1])
+            v = p2 - p1
+            L = np.linalg.norm(v)
+            if L < 1e-6: continue
+
+            # 각도와 거리(rho)를 기준으로 동일 선상(Collinear) 판별
+            a = np.degrees(np.arctan2(v[1], v[0])) % 180.0
+            ak = round(a, 0)
+            th = np.radians(ak)
+            rho = round((-p1[0] * np.sin(th) + p1[1] * np.cos(th)) / 10.0) * 10.0
+            key = (ak, rho)
+
+            if key not in groups: groups[key] = []
+            groups[key].append((l, p1, p2))
+
+        for (ak, _), grp in groups.items():
+            if len(grp) < 2: continue
+            dv = np.array([np.cos(np.radians(ak)), np.sin(np.radians(ak))])
+            # 선분의 진행 방향으로 정렬
+            segs = sorted([(np.dot(p1, dv), np.dot(p2, dv), p1, p2) for _, p1, p2 in grp],
+                          key=lambda x: min(x[0], x[1]))
+
+            # 정렬된 선분들 사이의 틈새 계산
+            for i in range(len(segs) - 1):
+                pe = segs[i][3] if segs[i][0] > segs[i][1] else segs[i][2]
+                pn = segs[i + 1][2] if segs[i + 1][0] > segs[i + 1][1] else segs[i + 1][3]
+                g = np.linalg.norm(pn - pe)
+
+                # 틈새가 임계값(150mm) 이내인 경우 이어줌
+                if 0.1 < g <= threshold_gap:
+                    bridges.append(LineString([tuple(pe), tuple(pn)]))
+        return lines + bridges
+
+    def robust_heal_1999(self, line_infos, max_gap=500.0):
+        """
+        [완전판] 외판(1999) 조각들을 수학적으로 결합한 뒤,
+        닫히지 않은 틈새(자신의 꼬리를 무는 틈새 포함)를 찾아 무조건 닫아줍니다.
+        """
+        if not line_infos: return []
+
+        from shapely.ops import linemerge
+        import numpy as np
+        from shapely.geometry import LineString
+
+        # 1. 쪼개진 1999 조각들을 일단 수학적으로 결합(Merge)하여 최대한 덩어리를 키웁니다.
+        raw_lines = [info['line'] for info in line_infos]
+        merged_geom = linemerge(raw_lines)
+
+        if merged_geom.geom_type == 'LineString':
+            merged_lines = [merged_geom]
+        elif merged_geom.geom_type == 'MultiLineString':
+            merged_lines = list(merged_geom.geoms)
+        else:
+            merged_lines = raw_lines
+
+        new_infos = []
+        for geom in merged_lines:
+            new_infos.append({
+                'line': geom,
+                'thickness': 10.0,
+                'type': '1999',
+                'color': '#333333'
+            })
+
+        # 2. "진짜 끝점"들만 추출 (폐곡선으로 닫히지 않은 부분)
+        endpoints = []
+        for i, info in enumerate(new_infos):
+            c = list(info['line'].coords)
+            if len(c) < 2: continue
+            # 이미 닫힌 루프(원)가 아니라면 양 끝점을 틈새 후보로 등록
+            if np.linalg.norm(np.array(c[0]) - np.array(c[-1])) > 1e-3:
+                endpoints.append({'idx': i, 'pt': np.array(c[0])})
+                endpoints.append({'idx': i, 'pt': np.array(c[-1])})
+
+        used_pts = set()
+        bridges = []
+
+        # 3. 끝점들끼리 최단 거리 짝 찾기 (💡자신의 시작점과 끝점을 연결하는 것도 허용!)
+        for i, ep1 in enumerate(endpoints):
+            if i in used_pts: continue
+
+            best_j = -1
+            best_dist = max_gap  # 기본 500mm 틈새까지 모두 추적
+
+            for j, ep2 in enumerate(endpoints):
+                if i == j or j in used_pts: continue
+
+                dist = np.linalg.norm(ep1['pt'] - ep2['pt'])
+                if dist <= best_dist:
+                    best_dist = dist
+                    best_j = j
+
+            # 4. 짝을 찾았다면 붉은색 브릿지로 강제 연결
+            if best_j != -1:
+                ep2 = endpoints[best_j]
+                bridges.append({
+                    'line': LineString([tuple(ep1['pt']), tuple(ep2['pt'])]),
+                    'thickness': 10.0,
+                    'type': '1999',
+                    # ✨ 어디가 힐링되었는지 눈으로 명확히 보이도록 연결부만 [빨간색]으로 칠합니다!
+                    'color': '#FF0000'
+                })
+                used_pts.add(i)
+                used_pts.add(best_j)
+
+        return new_infos + bridges
+
+    # =====================================================================
+    # 메인 프로세스
+    # =====================================================================
+    def load_and_process_dxf(self):
+        if self.is_processing: return
+        fname, _ = QFileDialog.getOpenFileName(self, 'Select DXF File', '', 'DXF files (*.dxf)')
+        if not fname: return
+        fname = os.path.abspath(os.path.normpath(fname))
+        self.reset_analysis_data()
+        self.result_box.clear()
+        self.current_dxf_path = fname
+        try:
+            scale = float(self.txt_scale.text())
+            try:
+                doc = ezdxf.readfile(fname, encoding='cp949')
+            except:
+                try:
+                    doc = ezdxf.readfile(fname, encoding='utf-8')
+                except:
+                    doc = ezdxf.readfile(fname)
+
+            msp = doc.modelspace()
+            active_layers = {l.dxf.name for l in doc.layers if l.is_on() and not l.is_frozen()}
+            t_1999, t_1204 = [], []
+            t_layers = {"-1102": [], "157": [], "6001": [], "7001": [], "8001": [], "9001": []}
+
+            for e in msp:
+                layer = e.dxf.layer.strip()
+                if layer not in active_layers: continue
+                pts = self._extract_pts(e, scale)
+                if not pts or len(pts) < 2: continue
+                ls = LineString(pts)
+                if layer == "1999":
+                    t_1999.append(ls)
+                elif layer == "-1204":
+                    t_1204.append(ls)
+                elif layer in t_layers:
+                    t_layers[layer].append(ls)
+
+            if t_1999:
+                u_1999 = unary_union(t_1999)
+                self.cx = u_1999.centroid.x
+                self.cy_base = u_1999.bounds[1]
+            else:
+                self.cx = self.cy_base = 0.0
+
+            shift = lambda ls: LineString([(p[0] - self.cx, p[1] - self.cy_base) for p in ls.coords])
+
+            # (기존) 1999 외판 단일화
+            self.raw_1999_lines = [shift(ls) for ls in t_1999]
+            m_1999 = unary_union(self.raw_1999_lines)
+            self.hull_centroid = m_1999.centroid
+
+            # ✨ 수정: 커터(Cutter) 강화 - 1204 레이어와 x=0을 이용한 완벽한 분할
+            cutters = []
+
+            # 1. -1204 레이어를 양방향으로 1000mm씩 과연장하여 외판을 확실히 절단
+            for c in [shift(ls) for ls in t_1204]:
+                c_coords = list(c.coords)
+                p1, p2 = np.array(c_coords[0]), np.array(c_coords[-1])
+                v = p2 - p1
+                L = np.linalg.norm(v)
+                if L > 1e-6:
+                    u = v / L
+                    # 확실한 교차를 위해 선분을 양쪽으로 길게 늘림
+                    cutters.append(LineString([tuple(p1 - u * 1000), tuple(p2 + u * 1000)]))
+
+            # 2. x=0 (Centerline) 커터 추가 (상하로 2000mm 연장)
+            y_min, y_max = m_1999.bounds[1], m_1999.bounds[3]
+            center_cutter = LineString([(0, y_min - 2000), (0, y_max + 2000)])
+            cutters.append(center_cutter)
+
+            # 3. 분할 실행
+            split_res = split(m_1999, unary_union(cutters)) if cutters else m_1999
+            pieces = list(split_res.geoms) if hasattr(split_res, 'geoms') else [split_res]
+
+            # 4. 파편 정리 (50mm 이하의 쓸모없는 찌꺼기는 버리고 의미 있는 외판 조각만 취합)
+            self.left_1999_segments = []
+            for g in pieces:
+                if g.length > 50.0:
+                    self.left_1999_segments.append(g)
+
+            self.left_1999_segments.sort(key=lambda s: (-round(s.centroid.y, 2), s.centroid.x))
+
+            self.lines_1102 = [shift(ls) for ls in t_layers["-1102"]]
+            self.lines_1102_raw = list(self.lines_1102)
+            self.lines_157 = [shift(ls) for ls in t_layers["157"]]
+
+            self.lines_6001 = [shift(ls) for ls in t_layers["6001"]]
+            self.lines_7001 = [shift(ls) for ls in t_layers["7001"]]
+            self.lines_8001 = [shift(ls) for ls in t_layers["8001"]]
+            self.lines_9001 = [shift(ls) for ls in t_layers["9001"]]
+            self.refresh_ui()
+            self.result_box.append(f"✅ Successfully loaded: {os.path.basename(fname)}")
+        except Exception as e:
+            self.result_box.setText(f"❌ Load Error Detailed:\n{traceback.format_exc()}")
+
+    def process_1d_geometry(self):
+        if self.is_processing: return
+        self.is_processing = True
+        self.btn_calc.setEnabled(False)
+        self.btn_load.setEnabled(False)
+
+        progress = QProgressDialog("1D Transformation Processing...", "Cancel", 0, 100, self)
+        progress.setWindowTitle("Processing...")
+        progress.setWindowModality(Qt.WindowModal)
+        progress.setAutoClose(True)
+        progress.show()
+        QApplication.processEvents()
+
+        # 도우미 함수 ---------------------------------------------------
+        def filter_short(lines, ml=100.0):
+            return [l for l in lines if l.length >= ml]
+
+        def remove_overlapping(lines, dt=10.0, at=5.0):
+            lines = sorted(lines, key=lambda x: x.length, reverse=True)
+            kept = []
+            kept_meta = []
+            for i, l in enumerate(lines):
+                if i % 10 == 0: QApplication.processEvents()
+                c = list(l.coords)
+                ps, pe = np.array(c[0]), np.array(c[-1])
+                v = pe - ps
+                ln = np.linalg.norm(v)
+                if ln < 1e-6: continue
+                ang = np.degrees(np.arctan2(v[1], v[0])) % 180
+                dup = False
+                for km in kept_meta:
+                    ak, pk1, vk, lk = km['ang'], km['ps'], km['v'], km['ln']
+                    if min(abs(ang - ak), 180 - abs(ang - ak)) > at: continue
+                    vu = vk / lk
+                    mid = (ps + pe) / 2.0
+                    if np.linalg.norm(mid - (pk1 + np.dot(mid - pk1, vu) * vu)) > dt: continue
+                    t1, t2 = np.dot(ps - pk1, vu), np.dot(pe - pk1, vu)
+                    if min(lk, max(t1, t2)) - max(0, min(t1, t2)) > ln * 0.8:
+                        dup = True
+                        break
+                if not dup:
+                    kept.append(l)
+                    kept_meta.append({'ang': ang, 'ps': ps, 'v': v, 'ln': ln})
+            return kept
+
+        def split_by_slope(line, at=5.0):
+            coords = list(line.coords)
+            if len(coords) < 3: return [line]
+            segs = []
+            cur = [coords[0]]
+            for i in range(1, len(coords) - 1):
+                cur.append(coords[i])
+                v1 = np.array(coords[i]) - np.array(coords[i - 1])
+                v2 = np.array(coords[i + 1]) - np.array(coords[i])
+                n1, n2 = np.linalg.norm(v1), np.linalg.norm(v2)
+                if n1 < 1e-6 or n2 < 1e-6: continue
+                a = np.degrees(np.arccos(np.clip(np.dot(v1, v2) / (n1 * n2), -1, 1)))
+                if a > at:
+                    segs.append(LineString(cur))
+                    cur = [coords[i]]
+            cur.append(coords[-1])
+            if len(cur) >= 2: segs.append(LineString(cur))
+            return segs
+
+        def match_pairs(lines, max_dist=100.0, angle_tol=20.0, overlap_tolerance=5.0):
+            if not lines: return []
+            ls_sorted = sorted(lines, key=lambda x: x.length)
+            meta = []
+            for i, l in enumerate(ls_sorted):
+                if i % 10 == 0: QApplication.processEvents()
+                c = list(l.coords)
+                ps, pe = np.array(c[0]), np.array(c[-1])
+                v = pe - ps
+                ln = np.linalg.norm(v)
+                if ln < 1e-6:
+                    meta.append(None)
+                    continue
+                minx, miny = min(ps[0], pe[0]), min(ps[1], pe[1])
+                maxx, maxy = max(ps[0], pe[0]), max(ps[1], pe[1])
+                meta.append({'ps': ps, 'pe': pe, 'v': v, 'ln': ln,
+                             'unit': v / ln, 'ang': np.degrees(np.arctan2(v[1], v[0])) % 180,
+                             'mid': (ps + pe) / 2.0,
+                             'minx': minx, 'miny': miny, 'maxx': maxx, 'maxy': maxy})
+            used = {i: [] for i in range(len(ls_sorted))}
+            pairs = []
+            for i in range(len(ls_sorted)):
+                if i % 10 == 0:
+                    QApplication.processEvents()
+                    if progress.wasCanceled(): raise UserWarning("User canceled.")
+                if meta[i] is None: continue
+                mi = meta[i]
+                best_j, best_d, best_ov = -1, float('inf'), None
+                mi_expand_minx = mi['minx'] - max_dist
+                mi_expand_maxx = mi['maxx'] + max_dist
+                mi_expand_miny = mi['miny'] - max_dist
+                mi_expand_maxy = mi['maxy'] + max_dist
+
+                for j in range(i + 1, len(ls_sorted)):
+                    if meta[j] is None: continue
+                    mj = meta[j]
+                    if (mj['maxx'] < mi_expand_minx or mj['minx'] > mi_expand_maxx or
+                            mj['maxy'] < mi_expand_miny or mj['miny'] > mi_expand_maxy):
+                        continue
+                    ad = min(abs(mi['ang'] - mj['ang']), 180 - abs(mi['ang'] - mj['ang']))
+                    if ad > angle_tol: continue
+                    proj_infinite = mj['ps'] + np.dot(mi['mid'] - mj['ps'], mj['unit']) * mj['unit']
+                    d = np.linalg.norm(mi['mid'] - proj_infinite)
+                    if d > max_dist: continue
+                    t1 = np.dot(mi['ps'] - mj['ps'], mj['unit'])
+                    t2 = np.dot(mi['pe'] - mj['ps'], mj['unit'])
+                    ov_s, ov_e = max(0, min(t1, t2)), min(mj['ln'], max(t1, t2))
+                    if (ov_e - ov_s) < mi['ln'] * 0.1: continue
+                    is_blocked = False
+                    for (us, ue) in used[j]:
+                        if min(ov_e, ue) - max(ov_s, us) > overlap_tolerance:
+                            is_blocked = True
+                            break
+                    if is_blocked: continue
+                    if d < best_d:
+                        best_d, best_j, best_ov = d, j, (ov_s, ov_e)
+                if best_j >= 0 and best_ov:
+                    used[best_j].append(best_ov)
+                    pairs.append((i, best_j, best_ov, best_d))
+            return [(ls_sorted[i], ls_sorted[j], ov, dist) for i, j, ov, dist in pairs]
+
+        def create_centerlines(pairs):
+            result = []
+            for i, (short_line, long_line, (ov_s, ov_e), dist) in enumerate(pairs):
+                if i % 10 == 0: QApplication.processEvents()
+                cs = list(short_line.coords)
+                cl_c = list(long_line.coords)
+                ps1, ps2 = np.array(cs[0]), np.array(cs[-1])
+                pl1 = np.array(cl_c[0])
+                vl = np.array(cl_c[-1]) - pl1
+                ll = np.linalg.norm(vl)
+                if ll < 1e-6: continue
+                vl_u = vl / ll
+                mids = []
+                for frac in np.linspace(0, 1, 5):
+                    pt_s = ps1 + (ps2 - ps1) * frac
+                    t = np.dot(pt_s - pl1, vl_u)
+                    pt_l = pl1 + t * vl_u
+                    mids.append(tuple((pt_s + pt_l) / 2.0))
+                result.append({'line': LineString(mids), 'thickness': round(dist * 2) / 2.0})
+            return result
+
+        def create_continuous_stiffener_centerlines(pairs):
+            long_line_map = {}
+            for short_line, long_line, (ov_s, ov_e), dist in pairs:
+                idx = id(long_line)
+                if idx not in long_line_map:
+                    long_line_map[idx] = {'long_line': long_line, 'shorts': [], 'dist': dist}
+                long_line_map[idx]['shorts'].append(short_line)
+
+            result = []
+            for data in long_line_map.values():
+                ll = data['long_line']
+                dist = data['dist']
+                shorts = data['shorts']
+                cl_c = list(ll.coords)
+                p1, p2 = np.array(cl_c[0]), np.array(cl_c[-1])
+                v = p2 - p1
+                length = np.linalg.norm(v)
+                if length < 1e-6: continue
+                vu = v / length
+
+                sl = shorts[0]
+                sc = list(sl.coords)
+                ps_mid = (np.array(sc[0]) + np.array(sc[-1])) / 2.0
+                pl_mid = (p1 + p2) / 2.0
+
+                vec = ps_mid - pl_mid
+                proj = np.dot(vec, vu) * vu
+                perp = vec - proj
+                perp_len = np.linalg.norm(perp)
+
+                if perp_len < 1e-6:
+                    n = np.array([-vu[1], vu[0]])
+                else:
+                    n = perp / perp_len
+
+                offset = n * (dist / 2.0)
+                new_coords = [tuple(np.array(pt) + offset) for pt in cl_c]
+                result.append({'line': LineString(new_coords), 'thickness': round(dist * 2) / 2.0})
+            return result
+
+        # 1차 보정: 10mm 제한 연장 및 삐져나감 정리 알고리즘
+        def extend_and_trim_10mm(centerlines):
+            base_geoms = [cl['line'] for cl in centerlines]
+            open_ends = []
+
+            for i, cl in enumerate(centerlines):
+                coords = list(cl['line'].coords)
+                for ei in [0, -1]:
+                    p = np.array(coords[ei])
+                    nb = 1 if ei == 0 else -2
+                    v = p - np.array(coords[nb])
+                    ln = np.linalg.norm(v)
+                    if ln < 1e-6: continue
+                    d = v / ln
+
+                    pt = Point(p)
+                    is_open = True
+                    for j, bg in enumerate(base_geoms):
+                        if i == j: continue
+                        if bg.distance(pt) < 1e-3:
+                            is_open = False
+                            break
+
+                    if is_open:
+                        ray = LineString([tuple(p), tuple(p + d * 10.0)])
+                        open_ends.append({
+                            'line_idx': i, 'end_idx': ei, 'p': p, 'd': d, 'ray': ray
+                        })
+
+            updates = {}
+            for k, oe in enumerate(open_ends):
+                ray = oe['ray']
+                p = oe['p']
+                best_dist = 10.0 + 1e-5
+                best_p = None
+
+                for j, bg in enumerate(base_geoms):
+                    if oe['line_idx'] == j: continue
+                    if ray.intersects(bg):
+                        inter = ray.intersection(bg)
+                        pts = [inter] if inter.geom_type == 'Point' else list(
+                            inter.geoms) if inter.geom_type == 'MultiPoint' else []
+                        for pt_int in pts:
+                            dist = np.linalg.norm(np.array([pt_int.x, pt_int.y]) - p)
+                            if 1e-3 < dist < best_dist:
+                                best_dist = dist
+                                best_p = (pt_int.x, pt_int.y)
+
+                for j, other_oe in enumerate(open_ends):
+                    if k == j: continue
+                    if oe['line_idx'] == other_oe['line_idx']: continue
+                    other_ray = other_oe['ray']
+                    if ray.intersects(other_ray):
+                        inter = ray.intersection(other_ray)
+                        pts = [inter] if inter.geom_type == 'Point' else list(
+                            inter.geoms) if inter.geom_type == 'MultiPoint' else []
+                        for pt_int in pts:
+                            dist = np.linalg.norm(np.array([pt_int.x, pt_int.y]) - p)
+                            if 1e-3 < dist < best_dist:
+                                best_dist = dist
+                                best_p = (pt_int.x, pt_int.y)
+
+                if best_p is not None:
+                    if oe['line_idx'] not in updates:
+                        updates[oe['line_idx']] = {}
+                    updates[oe['line_idx']][oe['end_idx']] = best_p
+
+            new_centerlines = []
+            for i, cl in enumerate(centerlines):
+                if i in updates:
+                    coords = list(cl['line'].coords)
+                    if 0 in updates[i]: coords[0] = updates[i][0]
+                    if -1 in updates[i]: coords[-1] = updates[i][-1]
+                    new_cl = cl.copy()
+                    new_cl['line'] = LineString(coords)
+                    new_centerlines.append(new_cl)
+                else:
+                    new_centerlines.append(cl)
+            return new_centerlines
+
+        # ✨ [부활] 2차 보정: 레이 캐스팅 (10mm 이상의 먼 거리 연장)
+        def raycast_extend(centerlines, max_dist=300.0):
+            extended_pts = []
+            result = []
+
+            # ✨ 1. 동적 충돌 맵(Dynamic Collision Map) 생성
+            # 이전 부재가 연장된 결과를 다음 부재가 즉시 인식할 수 있도록 복사본 생성
+            current_geoms = [cl['line'] for cl in centerlines]
+            bounds = [g.bounds for g in current_geoms]
+
+            for i, cl in enumerate(centerlines):
+                if i % 10 == 0: QApplication.processEvents()
+                coords = list(cl['line'].coords)
+                if len(coords) < 2:
+                    result.append(cl)
+                    continue
+
+                for ei in [0, -1]:
+                    p = np.array(coords[ei])
+                    nb = 1 if ei == 0 else -2
+                    v = p - np.array(coords[nb])
+                    vn = np.linalg.norm(v)
+                    if vn < 1e-6: continue
+                    d = v / vn
+
+                    # ✨ 2. 데드존 해결: 실제 선분(LineString)과의 최단 거리가 1.0mm(병합 허용치) 이내인지 검사
+                    pt_geom = Point(p)
+                    conn = False
+                    for j, o_geom in enumerate(current_geoms):
+                        if i == j: continue
+                        # 끝점뿐만 아니라 선분 중간에 닿아 있어도 완벽히 인식
+                        if pt_geom.distance(o_geom) <= 1.0:
+                            conn = True
+                            break
+                    if conn: continue
+
+                    # ✨ 3. 원본(centerlines)이 아닌 동적 맵(current_geoms)을 타겟으로 Ray 발사
+                    ray = LineString([tuple(p), tuple(p + d * max_dist)])
+                    rb = ray.bounds
+                    bp, bd = None, max_dist
+
+                    for j, o_geom in enumerate(current_geoms):
+                        if i == j: continue
+                        ob = bounds[j]
+                        if rb[2] < ob[0] or rb[0] > ob[2] or rb[3] < ob[1] or rb[1] > ob[3]:
+                            continue
+
+                        inter = ray.intersection(o_geom)
+                        if inter.is_empty: continue
+
+                        pts = []
+                        if inter.geom_type == 'Point':
+                            pts = [inter]
+                        elif inter.geom_type == 'MultiPoint':
+                            pts = list(inter.geoms)
+                        elif inter.geom_type == 'LineString':
+                            pts = [Point(inter.coords[0]), Point(inter.coords[-1])]
+
+                        for pt in pts:
+                            dd = np.linalg.norm(np.array([pt.x, pt.y]) - p)
+                            if 1e-3 < dd < bd:
+                                bd = dd
+                                bp = (pt.x, pt.y)
+
+                    if bp:
+                        overshoot = 0.1  # 확실한 교차 분할을 위한 과연장
+                        bp_o = (bp[0] + d[0] * overshoot, bp[1] + d[1] * overshoot)
+                        if ei == 0:
+                            coords[0] = bp_o
+                        else:
+                            coords[-1] = bp_o
+                        extended_pts.append(np.array(bp_o))
+
+                # ✨ 4. 현재 선분이 연장되었다면, 그 결과를 즉시 동적 맵(current_geoms)에 업데이트!
+                new_line = LineString(coords)
+                current_geoms[i] = new_line
+                bounds[i] = new_line.bounds
+
+                new_cl = cl.copy()
+                new_cl['line'] = new_line
+                result.append(new_cl)
+
+            return result, extended_pts
+
+        def split_all_lines_at_intersections(centerlines):
+            all_line_geoms = [cl['line'] for cl in centerlines]
+            bounds = [g.bounds for g in all_line_geoms]
+            intersection_points = []
+            for i in range(len(all_line_geoms)):
+                b1 = bounds[i]
+                for j in range(i + 1, len(all_line_geoms)):
+                    b2 = bounds[j]
+                    if b1[2] < b2[0] or b1[0] > b2[2] or b1[3] < b2[1] or b1[1] > b2[3]: continue
+                    try:
+                        inter = all_line_geoms[i].intersection(all_line_geoms[j])
+                        if inter.is_empty: continue
+                        if inter.geom_type == 'Point':
+                            intersection_points.append(inter)
+                        elif inter.geom_type == 'MultiPoint':
+                            intersection_points.extend(inter.geoms)
+                        # ✨ [핵심 추가] 동일 선상에서 겹쳐 선(LineString)으로 교차할 때 끝점 추출
+                        elif inter.geom_type == 'LineString':
+                            intersection_points.append(Point(inter.coords[0]))
+                            intersection_points.append(Point(inter.coords[-1]))
+                        elif inter.geom_type == 'MultiLineString':
+                            for ls in inter.geoms:
+                                intersection_points.append(Point(ls.coords[0]))
+                                intersection_points.append(Point(ls.coords[-1]))
+                    except:
+                        pass
+
+            for g in all_line_geoms:
+                intersection_points.append(Point(g.coords[0]))
+                intersection_points.append(Point(g.coords[-1]))
+
+            if not intersection_points: return centerlines
+
+            unique_points = []
+            for pt in intersection_points:
+                if not unique_points or min(pt.distance(upt) for upt in unique_points) > 1e-3:
+                    unique_points.append(pt)
+            splitter = unary_union(unique_points)
+
+            new_centerlines = []
+            for cl in centerlines:
+                line = cl['line']
+                try:
+                    snapped_line = snap(line, splitter, 0.05)
+                    res = split(snapped_line, splitter)
+                    geoms = list(res.geoms) if hasattr(res, 'geoms') else [res]
+                    for geom in geoms:
+                        new_cl = cl.copy()
+                        new_cl['line'] = geom
+                        new_centerlines.append(new_cl)
+                except:
+                    new_centerlines.append(cl)
+            return new_centerlines
+
+        def clean_topology(centerlines, trim_tol=15.0):
+            # 1. 중복 선분 제거 (이중 두께 및 중복 계산 방지)
+            unique_cl = []
+            seen = set()
+
+            for cl in centerlines:
+                c = list(cl['line'].coords)
+                if len(c) < 2: continue
+
+                p1, p2 = c[0], c[-1]
+                # ✨ 소수점 정밀도를 높여 멀쩡한 노드가 서로 다른 점으로 인식되는 현상 방지
+                p1_r = (round(p1[0], 3), round(p1[1], 3))
+                p2_r = (round(p2[0], 3), round(p2[1], 3))
+
+                # 0.5 미만의 미세한 찌꺼기 선분만 무시
+                if np.hypot(p2_r[0] - p1_r[0], p2_r[1] - p1_r[1]) < 0.5:
+                    continue
+
+                seg_key = tuple(sorted([p1_r, p2_r]))
+
+                if seg_key not in seen:
+                    seen.add(seg_key)
+                    unique_cl.append(cl)
+
+            # 2. 삐져나온 꼬리(Dangling) 반복 트림
+            while True:
+                endpoints = []
+                for cl in unique_cl:
+                    c = list(cl['line'].coords)
+                    endpoints.extend([(round(c[0][0], 3), round(c[0][1], 3)),
+                                      (round(c[-1][0], 3), round(c[-1][1], 3))])
+
+                from collections import Counter
+                node_degrees = Counter(endpoints)
+
+                to_keep = []
+                removed_any = False
+
+                for cl in unique_cl:
+                    c = list(cl['line'].coords)
+                    p1_r = (round(c[0][0], 3), round(c[0][1], 3))
+                    p2_r = (round(c[-1][0], 3), round(c[-1][1], 3))
+                    L = cl['line'].length
+
+                    if (node_degrees[p1_r] == 1 or node_degrees[p2_r] == 1) and L < trim_tol:
+                        removed_any = True
+                    else:
+                        to_keep.append(cl)
+
+                unique_cl = to_keep
+                if not removed_any:
+                    break
+
+            return unique_cl
+
+        def weld_vertices(centerlines, weld_tol=1.0):
+            """1mm 이내로 인접한 노드들을 강제로 하나의 좌표로 병합(Weld)하여 틈새를 0으로 만듦"""
+            endpoints = []
+            for cl in centerlines:
+                c = list(cl['line'].coords)
+                endpoints.extend([c[0], c[-1]])
+
+            # 인접 노드들을 하나의 대표 좌표로 묶는 딕셔너리 생성
+            welded_nodes = {}
+            for pt in endpoints:
+                found = False
+                for w_pt in welded_nodes:
+                    if np.hypot(pt[0] - w_pt[0], pt[1] - w_pt[1]) <= weld_tol:
+                        welded_nodes[pt] = w_pt
+                        found = True
+                        break
+                if not found:
+                    welded_nodes[pt] = pt
+
+            new_cl = []
+            for cl in centerlines:
+                c = list(cl['line'].coords)
+                p_s = welded_nodes.get(c[0], c[0])
+                p_e = welded_nodes.get(c[-1], c[-1])
+
+                # 병합 후 시작점과 끝점이 같아진(길이가 0이 된) 선분은 제외
+                if np.hypot(p_s[0] - p_e[0], p_s[1] - p_e[1]) > 0.1:
+                    new_item = cl.copy()
+                    c[0] = p_s
+                    c[-1] = p_e
+                    new_item['line'] = LineString(c)
+                    new_cl.append(new_item)
+
+            return new_cl
+
+        def heal_collinear_centerlines(centerlines, max_gap=400.0, angle_tol=2.0, align_tol=15.0):
+            """
+            정렬된 1D 중심선들 중, 동일 선상에 있으나 끊어져 있는 부재(Gap)를 찾아
+            새로운 선분(Bridge)으로 잇습니다.
+            """
+            meta = []
+            for i, cl in enumerate(centerlines):
+                c = list(cl['line'].coords)
+                if len(c) < 2: continue
+                p1, p2 = np.array(c[0]), np.array(c[-1])
+                v = p2 - p1
+                L = np.linalg.norm(v)
+                if L < 1e-6: continue
+                ang = np.degrees(np.arctan2(v[1], v[0])) % 180.0
+                meta.append({'cl': cl, 'p1': p1, 'p2': p2, 'ang': ang, 'v': v / L, 'L': L})
+
+            # 1. 각도와 수직 거리를 기반으로 동일 선상 그룹화
+            groups = []
+            for m in meta:
+                placed = False
+                for g in groups:
+                    g_ref = g[0]
+                    # 각도 차이 확인
+                    ang_diff = min(abs(m['ang'] - g_ref['ang']), 180 - abs(m['ang'] - g_ref['ang']))
+                    if ang_diff > angle_tol: continue
+
+                    # 두 직선 간의 평행 간격(수직 거리) 확인
+                    v_ref = g_ref['p2'] - g_ref['p1']
+                    v_target = g_ref['p1'] - m['p1']
+                    d = abs(v_ref[0] * v_target[1] - v_ref[1] * v_target[0]) / g_ref['L']
+                    if d <= align_tol:
+                        g.append(m)
+                        placed = True
+                        break
+                if not placed:
+                    groups.append([m])
+
+            # 2. 그룹 내에서 틈새(gap) 찾아 이어주기
+            bridges = []
+            for g in groups:
+                if len(g) < 2: continue
+                dv = g[0]['v']
+                segs = []
+                # 벡터 방향으로 투영(Projection)하여 선분 정렬
+                for m in g:
+                    t1 = np.dot(m['p1'], dv)
+                    t2 = np.dot(m['p2'], dv)
+                    if t1 > t2:
+                        segs.append({'t_min': t2, 't_max': t1, 'p_min': m['p2'], 'p_max': m['p1'], 'cl': m['cl']})
+                    else:
+                        segs.append({'t_min': t1, 't_max': t2, 'p_min': m['p1'], 'p_max': m['p2'], 'cl': m['cl']})
+
+                segs.sort(key=lambda x: x['t_min'])
+
+                # 정렬된 선분 사이의 간격 검사
+                for i in range(len(segs) - 1):
+                    gap = segs[i + 1]['t_min'] - segs[i]['t_max']
+                    # 겹친 상태(gap < 0)가 아니고, 최대 허용 틈새(max_gap) 이내일 때 연결
+                    if 0.1 < gap <= max_gap:
+                        new_line = LineString([tuple(segs[i]['p_max']), tuple(segs[i + 1]['p_min'])])
+                        # 양쪽 부재의 두께 평균을 물성치로 할당
+                        thk = (segs[i]['cl'].get('thickness', 10.0) + segs[i + 1]['cl'].get('thickness', 10.0)) / 2.0
+                        bridges.append({
+                            'line': new_line,
+                            'thickness': thk,
+                            'type': segs[i]['cl'].get('type', 'unknown'),
+                            'color': segs[i]['cl'].get('color', '#003087')
+                        })
+
+            return centerlines + bridges
+
+        # ---------------------------------------------------------------
+
+        try:
+            progress.setLabelText("Extracting DXF and Creating Initial 1D Lines...")
+            progress.setValue(10)
+            QApplication.processEvents()
+
+            # --- (기존 코드) Phase 1 진입 전 ---
+            y_mins = []
+            for l_seg in self.left_1999_segments:
+                y_mins.append(l_seg.bounds[1] - 10.0 / 2.0)
+            thickness_y_min = min(y_mins) if y_mins else 0.0
+
+            c1102 = [affinity.translate(l, yoff=-thickness_y_min) for l in self.lines_1102_raw]
+            c157 = [affinity.translate(l, yoff=-thickness_y_min) for l in self.lines_157]
+            l1999s = [affinity.translate(l, yoff=-thickness_y_min) for l in self.left_1999_segments]
+
+            c6001 = [affinity.translate(l, yoff=-thickness_y_min) for l in self.lines_6001]
+            c7001 = [affinity.translate(l, yoff=-thickness_y_min) for l in self.lines_7001]
+            c8001 = [affinity.translate(l, yoff=-thickness_y_min) for l in self.lines_8001]
+            c9001 = [affinity.translate(l, yoff=-thickness_y_min) for l in self.lines_9001]
+
+            # 3. 외판(1999) 중심선 생성
+            cl1999 = []
+
+            cl1999 = []
+            for ls in l1999s:
+                if ls.length > 50.0:
+                    cl1999.append({'line': ls, 'thickness': 10.0, 'type': '1999', 'color': '#333333'})
+
+            # ✨ 각도/그룹 무시하고 무조건 300mm 결합
+            cl1999 = self.robust_heal_1999(cl1999, max_gap=300.0)
+
+            s1102_raw, s157_raw = [], []
+            for l in filter_short(c1102, 10.0): s1102_raw.extend(split_by_slope(l, at=5.0))
+            for l in filter_short(c157, 10.0): s157_raw.extend(split_by_slope(l, at=5.0))
+
+            f1102 = remove_overlapping(filter_short(s1102_raw, 50.0), dt=1.0)
+            f157 = remove_overlapping(filter_short(s157_raw, 50.0), dt=1.0)
+
+            # --- 내부 부재 보정 (150mm 일괄 적용) ---
+            # heal_1102_collinear 대신 범용 함수인 heal_internal_collinear 사용
+            h1102 = self.heal_internal_collinear(f1102, threshold_gap=150.0)
+            h157 = self.heal_internal_collinear(f157, threshold_gap=150.0)  # 157 레이어도 150mm 틈새 보정 추가
+
+            p1102 = match_pairs(h1102, max_dist=100.0, angle_tol=5.0, overlap_tolerance=5.0)
+            p157 = match_pairs(h157, max_dist=100.0, angle_tol=5.0, overlap_tolerance=5.0)
+
+            cl1102 = create_centerlines(p1102)
+            for cl in cl1102: cl['type'] = '1102'
+            cl157 = create_centerlines(p157)
+            for cl in cl157: cl['type'] = '157'
+
+            progress.setLabelText("Grouping and Aligning Internal Members...")
+            progress.setValue(40)
+            QApplication.processEvents()
+
+            internal_cl = cl1102 + cl157
+            self.aligned_internal = self.group_and_align_centerlines(internal_cl, tol_dist=150.0, tol_angle=1.5)
+
+            all_cl = cl1999 + self.aligned_internal
+
+            progress.setLabelText("Phase 0.5: Healing Collinear Gaps...")
+            all_cl = heal_collinear_centerlines(all_cl, max_gap=400.0)
+
+            # ✨ 1차 보정: 근접한 틈새(10mm 이내) 삐져나감 정리 및 병합
+            progress.setLabelText("Phase 1: Healing Small Gaps (10mm)...")
+            progress.setValue(60)
+            all_cl = extend_and_trim_10mm(all_cl)
+            all_cl.sort(key=lambda x: 1 if x.get('type') == '157' else 0)
+
+            # ✨ 2차 보정: 원거리 틈새를 찾아 외판/교차점까지 확장 (Raycasting)
+            progress.setLabelText("Phase 2: Short Raycasting (50mm)...")
+            progress.setValue(65)
+            all_cl, _ = raycast_extend(all_cl, max_dist=50.0)
+
+            progress.setLabelText("Phase 2: Intermediate Topology Cleanup...")
+            progress.setValue(75)
+            all_cl = split_all_lines_at_intersections(all_cl)
+            all_cl = weld_vertices(all_cl, weld_tol=1.0)
+            all_cl = clean_topology(all_cl, trim_tol=100.0)  # 내부의 자잘한 꼬리 먼저 제거
+
+            progress.setLabelText("Phase 3: Deep Raycasting for Decks...")
+            progress.setValue(85)
+            # 내부가 깔끔해진 상태에서 데크 끝단 등 진짜 뚫려있는 곳만 길게 뻗어나감
+            all_cl, _ = raycast_extend(all_cl, max_dist=400.0)
+
+            progress.setLabelText("Phase 3: Final Topology Cleanup...")
+            progress.setValue(90)
+            all_cl = split_all_lines_at_intersections(all_cl)
+            all_cl = clean_topology(all_cl, trim_tol=300.0)
+            all_cl = weld_vertices(all_cl, weld_tol=1.0)
+
+            # ✨ 4차 정리: 맞닿은 선들을 노드별로 분할하여 위상(Topology) 확립
+            progress.setLabelText("Phase 4: Topology Cleanup...")
+            progress.setValue(90)
+            all_cl = split_all_lines_at_intersections(all_cl)
+
+            # ✨ 5차 최종 정리: 1.0mm 이내의 미세 틈새 노드 강제 병합(Weld)
+            progress.setLabelText("Phase 5: Welding Vertices...")
+            progress.setValue(98)
+            all_cl = weld_vertices(all_cl, weld_tol=1.0)
+
+            # ✨ 6차 최종 클린업: 이중 선분 제거 및 삐져나온 꼬리 트림 (새로 추가된 부분)
+            progress.setLabelText("Phase 6: Removing Duplicates and Trimming...")
+            progress.setValue(95)
+            # trim_tol=50.0 이면 50mm 이하로 삐져나온 꼬리를 전부 잘라냅니다. (필요 시 수정 가능)
+            all_cl = clean_topology(all_cl, trim_tol=100.0)
+
+            self.hull_only_centerlines = [cl.copy() for cl in all_cl]
+
+            progress.setLabelText("Processing Stiffeners (6001~9001)...")
+            raw_stiffs = c6001 + c7001 + c8001 + c9001
+            stiff_s_raw = []
+            for l in filter_short(raw_stiffs, 10.0):
+                stiff_s_raw.extend(split_by_slope(l, at=5.0))
+
+            stiff_s = remove_overlapping(filter_short(stiff_s_raw, 20.0), dt=1.0)
+            stiff_pairs = match_pairs(stiff_s, max_dist=50.0, angle_tol=20.0, overlap_tolerance=5.0)
+
+            stiff_cl = create_continuous_stiffener_centerlines(stiff_pairs)
+            for c in stiff_cl:
+                c['type'] = 'stiffener'
+                c['color'] = '#FF7F0E'  # 보강재를 도면에서 식별하기 위한 주황색 지정
+
+            # 주 구조물(all_cl)에 보강재(stiff_cl) 합병
+            all_cl.extend(stiff_cl)
+            self.final_healed_centerlines = all_cl
+
+            progress.setLabelText("Building Mathematical Graph...")
+            self.build_graph()
+
+            progress.setLabelText("Executing Flowchart Algorithm...")
+            self.execute_flowchart_algorithm()
+
+            progress.setLabelText("Calculating Section Properties...")
+            progress.setValue(99)
+            QApplication.processEvents()
+
+            total_area = 0.0
+            sum_qx = 0.0
+            segments_1d = []
+
+            # 1. 전체 면적 및 1차 모멘트(Qx) 계산
+            for cl in all_cl:
+                coords = list(cl['line'].coords)
+                thk = cl.get('thickness', 10.0)
+                if thk <= 0: thk = 10.0
+
+                for i in range(len(coords) - 1):
+                    x1, y1 = coords[i]
+                    x2, y2 = coords[i + 1]
+                    dx, dy = x2 - x1, y2 - y1
+                    L = np.hypot(dx, dy)
+                    if L < 1e-6: continue
+
+                    a = L * thk
+                    yc = (y1 + y2) / 2.0  # 선분의 무게중심 Y좌표
+
+                    total_area += a
+                    sum_qx += a * yc
+                    segments_1d.append((a, yc, dx, dy, L))
+
+            # 2. 중립축(N.A) 및 평행축 정리를 이용한 단면 2차 모멘트(Ixx) 계산
+            if total_area > 0:
+                na_y = sum_qx / total_area
+                ixx = 0.0
+                ixxm = 0.0
+
+                for a, yc, dx, dy, L in segments_1d:
+                    # 국부 관성모멘트 (Local Ixx)
+                    i_local = (a * (dy ** 2)) / 12.0
+                    # 평행축 정리
+                    ixx += i_local + a * ((yc - na_y) ** 2)
+                ixxm = ixx / 1e12
+
+                # 추후 전단응력 계산 등을 위해 클래스 변수에 저장
+                self.calc_total_area = total_area
+                self.calc_na_bl = na_y
+                self.calc_ixx = ixxm
+
+                calc_result_text = (
+                    f"\n\n📊 [Section Properties Result]\n"
+                    f"----------------------------------------\n"
+                    f"- Total Area (단면적)    : {total_area:,.2f} mm²\n"
+                    f"- N.A from Base (중립축) : {na_y:,.2f} mm\n"
+                    f"- Moment of Inertia (I_xx): {ixxm:,.2e} m⁴\n"
+                    f"----------------------------------------\n"
+                )
+            else:
+                calc_result_text = "\n\n❌ 유효한 단면적이 없어 이너시아를 계산할 수 없습니다."
+
+            # 3. 결과창 출력 텍스트 업데이트
+            summary_text = (
+                "✅ 1D Transformation & Full Healing Complete!\n\n"
+                f"- Extracted Outer Hull Lines (1999): {len(cl1999)}\n"
+                f"- Aligned Internal Lines (1102, 157): {len(self.aligned_internal)}\n"
+                f"- Added Stiffeners (6001~9001): {len(stiff_cl)}\n"
+                f"- Final Healed Elements: {len(all_cl)}"
+                f"{calc_result_text}"
+                f"{self.graph_summary}"  # ✨ 추가됨
+            )
+            self.result_box.setText(summary_text)
+
+            self.is_calculated = True
+            progress.setValue(100)
+            self.refresh_ui()
+
+        except Exception as e:
+            import traceback
+            self.result_box.setText(f"❌ Error:\n{str(e)}\n\n{traceback.format_exc()}")
+        finally:
+            progress.close()
+            self.is_processing = False
+            self.btn_calc.setEnabled(True)
+            self.btn_load.setEnabled(True)
+
+        # =====================================================================
+        # ✨ 신규 추가: 위상 노드 추출 (반단면 컷팅 & 선분 클릭 이벤트 포함)
+        # =====================================================================
+    def build_graph(self):
+        from collections import defaultdict
+        from shapely.geometry import box, LineString
+        import numpy as np
+
+        # ==================================================
+        # 1. 중심선(Centerline) 컷팅 위치 계산 (가장 높은 지점의 X 기준)
+        # ==================================================
+        max_y_global = -float('inf')
+        highest_xs = []
+        for cl in self.final_healed_centerlines:
+            if cl.get('type') in ['6001', '7001', '8001', '9001', 'stiffener']:
+                continue
+            for cx, cy in cl['line'].coords:
+                if cy > max_y_global + 1e-3:
+                    max_y_global = cy
+                    highest_xs = [cx]
+                elif abs(cy - max_y_global) <= 1e-3:
+                    highest_xs.append(cx)
+
+        self.x_cut = sum(highest_xs) / len(highest_xs) if highest_xs else 0.0
+
+        # 반단면 컷팅용 박스 생성 (x_cut 기준으로 좌측만 남김, 오차 허용치 +0.5)
+        keep_box = box(-9999999.0, -9999999.0, self.x_cut + 0.5, 9999999.0)
+
+        raw_nodes = {}
+        raw_edges = []
+        node_map = {}
+        nid_counter = 1
+
+        def get_nid(pt):
+            nonlocal nid_counter
+            for ept, eid in node_map.items():
+                # 1.0mm 이내의 점들은 동일 노드로 취급
+                if np.hypot(ept[0] - pt[0], ept[1] - pt[1]) < 1.0:
+                    return eid
+            node_map[pt] = nid_counter
+            raw_nodes[nid_counter] = pt
+            nid_counter += 1
+            return node_map[pt]
+
+        # ==================================================
+        # 2. 중심선 컷팅 및 초기 선분(Edge) 생성
+        # ==================================================
+        for cl in self.final_healed_centerlines:
+            if cl.get('type') in ['6001', '7001', '8001', '9001', 'stiffener']:
+                continue
+
+            geom = cl['line']
+
+            # ✨ 중심선(keep_box)을 기준으로 컷팅! (여기서 컷팅된 지점이 자연스럽게 끝점 좌표가 됨)
+            clipped = geom.intersection(keep_box)
+            if clipped.is_empty: continue
+
+            geoms = [clipped] if clipped.geom_type == 'LineString' else \
+                list(clipped.geoms) if clipped.geom_type == 'MultiLineString' else []
+
+            for g in geoms:
+                if g.length < 1.0: continue  # 너무 짧은 찌꺼기 무시
+                c = list(g.coords)
+
+                # 끝점이 get_nid를 통과하며 중심선에 잘린 위치에도 정확히 노드가 생성됨
+                u, v = get_nid(c[0]), get_nid(c[-1])
+                raw_edges.append({
+                    'u': u, 'v': v,
+                    'coords': c,
+                    'thickness': cl.get('thickness', 10.0),
+                    'type': cl.get('type', 'unknown')
+                })
+
+        # ==================================================
+        # 3. 인접 노드(Degree 2) 병합 알고리즘 (곡선 경로 보존)
+        # ==================================================
+        while True:
+            node_to_edges = defaultdict(list)
+            for i, e in enumerate(raw_edges):
+                if e is None: continue
+                node_to_edges[e['u']].append(i)
+                if e['u'] != e['v']:
+                    node_to_edges[e['v']].append(i)
+
+            merged_any = False
+            for nid, edge_indices in node_to_edges.items():
+                if len(edge_indices) == 2:
+                    # ✨ 아주 중요한 예외 처리: 중심선(x_cut)에 위치한 노드는 병합하여 삭제하지 않고 구조적 경계로 무조건 보존
+                    node_pt = raw_nodes[nid]
+                    if abs(node_pt[0] - self.x_cut) <= 1.5:
+                        continue
+
+                    e1_idx, e2_idx = edge_indices[0], edge_indices[1]
+                    if e1_idx == e2_idx: continue
+                    e1, e2 = raw_edges[e1_idx], raw_edges[e2_idx]
+
+                    # 타입이나 두께가 다르면 교차점으로 인식하여 병합 안 함
+                    if abs(e1['thickness'] - e2['thickness']) > 0.1 or e1['type'] != e2['type']:
+                        continue
+
+                    c1, c2 = e1['coords'], e2['coords']
+
+                    if e1['v'] == nid:
+                        c1_ordered, u_new = c1, e1['u']
+                    else:
+                        c1_ordered, u_new = c1[::-1], e1['v']
+
+                    if e2['u'] == nid:
+                        c2_ordered, v_new = c2[1:], e2['v']
+                    else:
+                        c2_ordered, v_new = c2[::-1][1:], e2['u']
+
+                    merged_coords = c1_ordered + c2_ordered
+
+                    raw_edges[e1_idx] = {
+                        'u': u_new, 'v': v_new,
+                        'coords': merged_coords,
+                        'thickness': e1['thickness'],
+                        'type': e1['type']
+                    }
+                    raw_edges[e2_idx] = None
+                    merged_any = True
+                    break
+
+            if not merged_any: break
+
+        # ==================================================
+        # 4. 최종 그래프 구조화
+        # ==================================================
+        self.graph_nodes = {}
+        self.graph_edges = []
+        final_raw_edges = [e for e in raw_edges if e is not None]
+
+        active_nids = set()
+        for e in final_raw_edges:
+            active_nids.update([e['u'], e['v']])
+
+        for nid in active_nids:
+            self.graph_nodes[nid] = raw_nodes[nid]
+
+        for i, e in enumerate(final_raw_edges):
+            geom = LineString(e['coords'])
+            self.graph_edges.append({
+                'id': i,
+                'start_node': e['u'],
+                'start_coord': self.graph_nodes[e['u']],
+                'end_node': e['v'],
+                'end_coord': self.graph_nodes[e['v']],
+                'thickness': e['thickness'],
+                'length': geom.length,
+                'geometry': geom,
+                'type': e['type']
+            })
+
+        self.graph_summary = (
+            f"\n\n📊 [Half-Section Graphification Result]\n"
+            f"----------------------------------------\n"
+            f"- 중심선 컷팅 X 좌표 : {self.x_cut:.2f} mm\n"
+            f"- 유효 노드 (Nodes)  : {len(self.graph_nodes)} 개\n"
+            f"- 생성된 선분 (Edges)  : {len(self.graph_edges)} 개\n"
+            f"----------------------------------------\n"
+            )
+
+        # =====================================================================
+        # ✨ 첨부된 순서도(Flowchart)의 완벽한 논리 이식
+        # =====================================================================
+    def execute_flowchart_algorithm(self):
+        """순서도에 명시된 Free Node Pruning과 Loop Detection을 엄격하게 수행합니다."""
+        # 그래프 파괴를 동반하므로 복사본 생성
+        working_edges = {e['id']: {'u': e['start_node'], 'v': e['end_node']} for e in self.graph_edges}
+        slit_nodes_ids = []
+
+        def get_degrees(edges_dict):
+            deg = {}
+            for e in edges_dict.values():
+                deg[e['u']] = deg.get(e['u'], 0) + 1
+                deg[e['v']] = deg.get(e['v'], 0) + 1
+            return deg
+
+        while True:
+            # ---------------------------------------------------------
+            # [Phase 1: 좌측 순서도] 자유 노드 가지치기 (Prune Free Nodes)
+            # ---------------------------------------------------------
+            while True:
+                deg = get_degrees(working_edges)
+                free_nodes = [n for n, d in deg.items() if d == 1]
+
+                # "Is there a free node remaining? -> NO"
+                if not free_nodes:
+                    break
+
+                    # "Start a new path at any free node: i = Current node"
+                i = free_nodes[0]
+
+                while True:
+                    # "Check which member node 'i' belongs to: m = Current member"
+                    m = None
+                    for eid, e in working_edges.items():
+                        if e['u'] == i or e['v'] == i:
+                            m = eid
+                            break
+                    if m is None: break
+
+                    # "Go from node 'i' to remaining node of member 'm': j = Next node"
+                    j = working_edges[m]['v'] if working_edges[m]['u'] == i else working_edges[m]['u']
+                    deg_j = get_degrees(working_edges).get(j, 0)
+
+                    # "Delete member 'm' and node 'i'"
+                    del working_edges[m]
+
+                    # 상태 판별
+                    if deg_j == 1:
+                        # "Is node 'j' a free node? -> YES -> END (경로 중지)"
+                        break
+                    elif deg_j >= 3:
+                        # "Is node 'j' a bridge node? -> YES -> Stop path and start a new path"
+                        break
+                    else:
+                        # "Is node 'j' a bridge node? -> NO -> Assign 'j' as Current Node: i=j"
+                        i = j
+
+                        # ---------------------------------------------------------
+            # [Phase 2: 우측 순서도] 루프 탐지 (Loop Detection & Cutting)
+            # ---------------------------------------------------------
+            deg = get_degrees(working_edges)
+            remaining_nodes = [n for n, d in deg.items() if d > 0]
+
+            # "Is there any node remaining? -> NO -> END"
+            if not remaining_nodes:
+                break
+
+                # "There is at least one loop. Start anywhere: i = Current node"
+            i = remaining_nodes[0]
+            visited_nodes = {i}
+            visited_members = set()
+
+            while True:
+                # "Choose any one of the unvisited member(s) node 'i' belongs to: m"
+                attached_edges = [eid for eid, e in working_edges.items() if
+                                  (e['u'] == i or e['v'] == i) and eid not in visited_members]
+                if not attached_edges: break  # 예외 안전장치
+
+                m = attached_edges[0]
+                # "Mark member 'm' and node 'i' as visited"
+                visited_members.add(m)
+
+                # "Go from node 'i' to remaining node of member 'm': j = Next node"
+                j = working_edges[m]['v'] if working_edges[m]['u'] == i else working_edges[m]['u']
+
+                # "Is 'j' a previously visited node?"
+                if j in visited_nodes:
+                    # "YES -> New Loop Found. Cut the newly found loop at any node"
+                    slit_nodes_ids.append(j)
+                    del working_edges[m]  # 슬릿 생성(해당 부재 절단)
+                    break  # 루프가 끊어졌으므로 다시 좌측(Phase 1)으로 돌아감
+                else:
+                    # "NO -> Assign 'j' as the Current Node: i = j"
+                    visited_nodes.add(j)
+                    i = j
+
+        self.flowchart_slit_nodes = list(set(slit_nodes_ids))
+
+    def on_edge_click(self, event):
+        """그래프 선분 클릭 시 정보를 표시하는 이벤트 핸들러"""
+        if event.artist and hasattr(event.artist, 'get_gid'):
+            gid = event.artist.get_gid()
+            if gid is not None and str(gid).startswith("edge_"):
+                edge_id = int(str(gid).split("_")[1])
+                edge = self.graph_edges[edge_id]
+
+                info_text = (
+                    f"🔹 [선분 상세 정보]\n\n"
+                    f" - 부재 타입 : {edge['type']}\n"
+                    f" - 시작 노드 : Node {edge['start_node']} (X: {edge['start_coord'][0]:.1f}, Y: {edge['start_coord'][1]:.1f})\n"
+                    f" - 끝 노드   : Node {edge['end_node']} (X: {edge['end_coord'][0]:.1f}, Y: {edge['end_coord'][1]:.1f})\n"
+                    f" - 두께(t)   : {edge['thickness']} mm\n"
+                    f" - 길이(L)   : {edge['length']:,.2f} mm"
+                )
+                from PySide6.QtWidgets import QMessageBox
+                QMessageBox.information(self, f"Edge ID: {edge_id}", info_text)
+
+    def refresh_ui(self):
+        self.fig1.clear()
+        self.fig2.clear()
+        ax1, ax2 = self.fig1.add_subplot(111), self.fig2.add_subplot(111)
+
+        if self.is_calculated:
+            # ----------------------------------------------------
+            # [도면 1 (ax1): 최종 1D 형상 뷰] (기존 동일)
+            # ----------------------------------------------------
+            if hasattr(self, 'final_healed_centerlines'):
+                for cl in self.final_healed_centerlines:
+                    lo = cl['line']
+                    c_type = cl.get('type')
+                    final_color = '#000000' if c_type == '1999' else ('#FF7F0E' if c_type == 'stiffener' else '#003087')
+                    thk = cl.get('thickness', 10.0)
+                    visual_thk = thk if thk >= 50.0 else 50.0
+
+                    if visual_thk > 0:
+                        try:
+                            poly = lo.buffer(visual_thk / 2.0, cap_style=2)
+                            if poly.geom_type == 'Polygon':
+                                ax1.fill(*poly.exterior.xy, color=final_color, alpha=0.3, zorder=9, edgecolor='none')
+                            elif poly.geom_type == 'MultiPolygon':
+                                for p in poly.geoms:
+                                    ax1.fill(*p.exterior.xy, color=final_color, alpha=0.3, zorder=9, edgecolor='none')
+                        except: pass
+                    ax1.plot(*lo.xy, color=final_color, linewidth=2.0, alpha=0.9, zorder=10)
+
+            # ----------------------------------------------------
+            # ✨ [도면 2 (ax2): 클릭 가능한 그래프 뷰 (슬릿 로직 완전 삭제)]
+            # ----------------------------------------------------
+            if hasattr(self, 'graph_edges'):
+                for edge in self.graph_edges:
+                    geom = edge['geometry']
+                    ax2.plot(*geom.xy, color='dodgerblue', linewidth=2.5, alpha=0.8,
+                             zorder=10, picker=5, gid=f"edge_{edge['id']}")
+
+                node_xs = [pt[0] for pt in self.graph_nodes.values()]
+                node_ys = [pt[1] for pt in self.graph_nodes.values()]
+                ax2.scatter(node_xs, node_ys, color='red', s=40, zorder=20, edgecolors='black')
+
+                for nid, pt in self.graph_nodes.items():
+                    ax2.annotate(str(nid), (pt[0], pt[1]), xytext=(4, 4), textcoords='offset points',
+                                 color='black', fontsize=9, fontweight='bold', zorder=25)
+
+                # ✨ 새로 추가된 부분: 알고리즘에 의해 도출된 슬릿 노드 특별 시각화
+                if hasattr(self, 'flowchart_slit_nodes') and self.flowchart_slit_nodes:
+                    slit_xs = [self.graph_nodes[nid][0] for nid in self.flowchart_slit_nodes]
+                    slit_ys = [self.graph_nodes[nid][1] for nid in self.flowchart_slit_nodes]
+
+                    # 눈에 잘 띄도록 밝은 연두색의 거대한 별모양(*) 마커 적용
+                    ax2.scatter(slit_xs, slit_ys, color='lime', marker='*', s=250,
+                                zorder=30, edgecolors='black', label='Slit Position (Cut Node)')
+                    ax2.legend(loc='upper right')
+
+        else:
+            if hasattr(self, 'raw_1999_lines') and self.raw_1999_lines:
+                for ls in self.raw_1999_lines:
+                    ax1.plot(*ls.xy, color='black', lw=1.2, alpha=0.8, zorder=5)
+                    ax2.plot(*ls.xy, color='black', lw=1.2, alpha=0.8, zorder=5)
+
+        for ax in [ax1, ax2]:
+            ax.set_aspect('equal')
+            ax.grid(True, lw=0.3)
+            ax.xaxis.set_major_formatter(FuncFormatter(lambda x, pos: f"{-x:g}"))
+
+        self.can1.draw()
+        self.can2.draw()
+
+    def get_topological_nodes(self, centerlines, tolerance=1.0):
+        """
+        교차점 노드를 추출하되, '일직선 상에 있으면서 두께 변화가 없는' 불필요한 노드는 탈락시킵니다.
+        (6001~9001 보강재 레이어는 노드 생성에서 제외)
+        """
+        from collections import defaultdict
+        import numpy as np
+
+        node_map = defaultdict(list)
+        # 1. 좌표별 연결된 선분 정보 기록
+        for cl in centerlines:
+            # ✨ 보강재 레이어(6001~9001, stiffener)는 노드 추출 대상에서 완전히 제외합니다.
+            if cl.get('type') in ['6001', '7001', '8001', '9001', 'stiffener']:
+                continue
+
+            coords = list(cl['line'].coords)
+            if len(coords) < 2: continue
+            for pt in [tuple(coords[0]), tuple(coords[-1])]:
+                found = False
+                for existing_pt in node_map.keys():
+                    if np.linalg.norm(np.array(pt) - np.array(existing_pt)) < tolerance:
+                        node_map[existing_pt].append(cl)
+                        found = True
+                        break
+                if not found:
+                    node_map[pt].append(cl)
+
+        final_nodes = []
+
+        # 바깥쪽으로 향하는 방향 벡터를 구하는 내부 함수
+        def get_outward_vector(cl, p_ref):
+            c = list(cl['line'].coords)
+            p_ref_arr = np.array(p_ref)
+            d_start = np.linalg.norm(np.array(c[0]) - p_ref_arr)
+            d_end = np.linalg.norm(np.array(c[-1]) - p_ref_arr)
+
+            if d_start < d_end:
+                v = np.array(c[1]) - np.array(c[0])
+            else:
+                v = np.array(c[-2]) - np.array(c[-1])
+
+            norm = np.linalg.norm(v)
+            return v / norm if norm > 1e-6 else np.array([0, 0])
+
+        # 2. 조건에 따른 노드 필터링 및 탈락
+        for pt, connected_cls in node_map.items():
+            if len(connected_cls) >= 3:
+                final_nodes.append(pt)
+
+            elif len(connected_cls) == 2:
+                cl1, cl2 = connected_cls[0], connected_cls[1]
+                t1 = cl1.get('thickness', 10.0)
+                t2 = cl2.get('thickness', 10.0)
+
+                if abs(t1 - t2) > 1e-3:
+                    final_nodes.append(pt)
+                    continue
+
+                v1 = get_outward_vector(cl1, pt)
+                v2 = get_outward_vector(cl2, pt)
+                cos_theta = np.dot(v1, v2)
+
+                if cos_theta > -0.996:
+                    final_nodes.append(pt)
+                else:
+                    pass
+
+        return final_nodes
+
+
+if __name__ == "__main__":
+    app = QApplication(sys.argv)
+    win = UltimateShipAnalyzer()
+    win.show()
+    sys.exit(app.exec())
+    
