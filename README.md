@@ -1583,6 +1583,8 @@ class UltimateShipAnalyzer(QMainWindow):
                 if degree == 1:  # Degree가 1인 노드 (자유 노드)
                     self.node_q[nid] = 0.0  # Q = 0 설정
 
+        self.cut_edge_ids = []
+
         while True:
             # ---------------------------------------------------------
             # [Phase 1: 좌측 순서도] 자유 노드 가지치기 (Prune Free Nodes)
@@ -1657,6 +1659,7 @@ class UltimateShipAnalyzer(QMainWindow):
                 if j in visited_nodes:
                     # "YES -> New Loop Found. Cut the newly found loop at any node"
                     slit_nodes_ids.append(j)
+                    self.cut_edge_ids.append(m)
                     del working_edges[m]  # 슬릿 생성(해당 부재 절단)
                     break  # 루프가 끊어졌으므로 다시 좌측(Phase 1)으로 돌아감
                 else:
@@ -1695,6 +1698,8 @@ class UltimateShipAnalyzer(QMainWindow):
             adj[e['end_node']].append(e['id'])
             nm[e['start_node']] += 1
             nm[e['end_node']] += 1
+
+        valid_edges = [e for e in self.graph_edges if e['id'] not in getattr(self, 'cut_edge_ids', [])]
 
         vn = {nid: 0 for nid in self.graph_nodes}
         vm = {e['id']: 0 for e in self.graph_edges}
@@ -1803,6 +1808,27 @@ class UltimateShipAnalyzer(QMainWindow):
                     else:
                         q_out_from_node[i] = flow_into_node[i]
 
+                max_q = 0.0
+                max_edge_id = None
+
+                for eid, res in self.edge_q_results.items():
+                    # 선분 양 끝단 중 절대값이 가장 큰 값을 기준으로 함
+                    local_max = max(abs(res['q_start']), abs(res['q_end']))
+                    if local_max > max_q:
+                        max_q = local_max
+                        max_edge_id = eid
+
+                self.max_qd_value = max_q
+                self.max_qd_edge = max_edge_id
+
+                # 결과창 텍스트에 추가
+                result_text = self.result_box.toPlainText()
+                result_text += f"\n\n🔥 [Determinate Shear Flow Result]\n"
+                result_text += f"----------------------------------------\n"
+                result_text += f"- Max Shear Flow (|q_d|) : {max_q:,.2f} N/mm (Edge ID: {max_edge_id})\n"
+                result_text += f"----------------------------------------\n"
+                self.result_box.setText(result_text)
+
     def on_edge_click(self, event):
         """그래프 선분 클릭 시 정보를 표시하는 이벤트 핸들러"""
         if event.artist and hasattr(event.artist, 'get_gid'):
@@ -1812,7 +1838,10 @@ class UltimateShipAnalyzer(QMainWindow):
                 edge = self.graph_edges[edge_id]
 
                 length_m = edge['length'] / 1000.0  # mm -> m 변환
-                delta_S_m3 = edge['delta_S'] / 1e9  # mm³ -> m³ 변환
+
+                # ✨ 에러 수정: delta_S 대신 분리된 Sz와 Sy를 가져옵니다. (안전하게 get 사용)
+                delta_Sz_m3 = edge.get('delta_Sz', 0.0) / 1e9  # mm³ -> m³ 변환
+                delta_Sy_m3 = edge.get('delta_Sy', 0.0) / 1e9  # mm³ -> m³ 변환
 
                 info_text = (
                     f"🔹 [선분 상세 정보]\n\n"
@@ -1820,8 +1849,10 @@ class UltimateShipAnalyzer(QMainWindow):
                     f" - 시작 노드 : Node {edge['start_node']} (X: {edge['start_coord'][0]:.1f}, Y: {edge['start_coord'][1]:.1f})\n"
                     f" - 끝 노드   : Node {edge['end_node']} (X: {edge['end_coord'][0]:.1f}, Y: {edge['end_coord'][1]:.1f})\n"
                     f" - 두께(t)   : {edge['thickness']} mm\n"
-                    f" - 길이(L)   : {length_m:,.3f} m\n"  # ✨ 단위 m로 표시
-                    f" - 1차 모멘트(ΔS) : {delta_S_m3:,.5f} m³"  # ✨ 단위 m³로 표시 (소수점 5자리)
+                    f" - 길이(L)   : {length_m:,.3f} m\n"
+                    # ✨ UI에도 두 축에 대한 모멘트를 모두 표시
+                    f" - 1차 모멘트(ΔSz) : {delta_Sz_m3:,.5f} m³\n"
+                    f" - 1차 모멘트(ΔSy) : {delta_Sy_m3:,.5f} m³"
                 )
                 from PySide6.QtWidgets import QMessageBox
                 QMessageBox.information(self, f"Edge ID: {edge_id}", info_text)
@@ -1858,11 +1889,40 @@ class UltimateShipAnalyzer(QMainWindow):
             # ✨ [도면 2 (ax2): 클릭 가능한 그래프 뷰 (슬릿 로직 완전 삭제)]
             # ----------------------------------------------------
             if hasattr(self, 'graph_edges'):
+                import matplotlib.colors as mcolors
+
+                # 1. 색상 매핑을 위한 정규화 (Normalization) 준비
+                if hasattr(self, 'edge_q_results') and self.edge_q_results:
+                    # 0 나누기 방지를 위해 최소값 1e-9 설정
+                    max_abs_q = max(
+                        (max(abs(res['q_start']), abs(res['q_end'])) for res in self.edge_q_results.values()),
+                        default=1e-9)
+                    if max_abs_q == 0: max_abs_q = 1e-9
+                    norm = mcolors.Normalize(vmin=0, vmax=max_abs_q)
+                    cmap = cm.jet  # 히트맵 컬러맵 (파랑 -> 초록 -> 노랑 -> 빨강)
+                else:
+                    norm = None
+                    cmap = None
+
+                # 2. 선분 그리기 (히트맵 색상 적용)
                 for edge in self.graph_edges:
                     geom = edge['geometry']
-                    ax2.plot(*geom.xy, color='dodgerblue', linewidth=2.5, alpha=0.8,
-                             zorder=10, picker=5, gid=f"edge_{edge['id']}")
+                    eid = edge['id']
 
+                    if norm and cmap and eid in getattr(self, 'edge_q_results', {}):
+                        # 선분 양 끝점 q의 절대값 평균을 대표 색상으로 사용
+                        avg_q = (abs(self.edge_q_results[eid]['q_start']) + abs(
+                            self.edge_q_results[eid]['q_end'])) / 2.0
+                        edge_color = cmap(norm(avg_q))
+                        lw = 3.5  # 응력이 들어간 선은 약간 더 굵게 표현
+                    else:
+                        edge_color = 'dodgerblue'
+                        lw = 2.5
+
+                    ax2.plot(*geom.xy, color=edge_color, linewidth=lw, alpha=0.9,
+                             zorder=10, picker=5, gid=f"edge_{eid}")
+
+                # 3. 노드 표시 (기존 코드 유지)
                 node_xs = [pt[0] for pt in self.graph_nodes.values()]
                 node_ys = [pt[1] for pt in self.graph_nodes.values()]
                 ax2.scatter(node_xs, node_ys, color='red', s=40, zorder=20, edgecolors='black')
@@ -1871,15 +1931,37 @@ class UltimateShipAnalyzer(QMainWindow):
                     ax2.annotate(str(nid), (pt[0], pt[1]), xytext=(4, 4), textcoords='offset points',
                                  color='black', fontsize=9, fontweight='bold', zorder=25)
 
-                # ✨ 새로 추가된 부분: 알고리즘에 의해 도출된 슬릿 노드 특별 시각화
+                # 4. 루프 절단점 (Slit Nodes) 표시 (기존 유지)
                 if hasattr(self, 'flowchart_slit_nodes') and self.flowchart_slit_nodes:
                     slit_xs = [self.graph_nodes[nid][0] for nid in self.flowchart_slit_nodes]
                     slit_ys = [self.graph_nodes[nid][1] for nid in self.flowchart_slit_nodes]
-
-                    # 눈에 잘 띄도록 밝은 연두색의 거대한 별모양(*) 마커 적용
                     ax2.scatter(slit_xs, slit_ys, color='lime', marker='*', s=250,
                                 zorder=30, edgecolors='black', label='Slit Position (Cut Node)')
-                    ax2.legend(loc='upper right')
+
+                # ✨ 5. 최대 전단 흐름(Max q_d) 지점 강조 마커 추가
+                if hasattr(self, 'max_qd_edge') and self.max_qd_edge is not None:
+                    max_edge = self.graph_edges[self.max_qd_edge]
+                    max_geom = max_edge['geometry']
+
+                    # 해당 선분의 중간 지점 좌표 계산
+                    mid_x = (max_geom.coords[0][0] + max_geom.coords[-1][0]) / 2.0
+                    mid_y = (max_geom.coords[0][1] + max_geom.coords[-1][1]) / 2.0
+
+                    # 돋보이는 마젠타색 역삼각형 마커
+                    ax2.scatter(mid_x, mid_y, color='magenta', marker='v', s=200,
+                                edgecolors='black', zorder=35, label='Max Shear Flow')
+
+                    # 수치 주석(Annotation) 말풍선 달기
+                    ax2.annotate(f'Max |q|: {self.max_qd_value:.1f}', (mid_x, mid_y),
+                                 xytext=(15, 15), textcoords='offset points',
+                                 color='magenta', fontweight='bold', fontsize=11,
+                                 bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="magenta", alpha=0.8),
+                                 zorder=40)
+
+                # 범례(Legend) 업데이트
+                handles, labels = ax2.get_legend_handles_labels()
+                if handles:
+                    ax2.legend(handles, labels, loc='upper right')
 
         else:
             if hasattr(self, 'raw_1999_lines') and self.raw_1999_lines:
