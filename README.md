@@ -1649,6 +1649,41 @@ class UltimateShipAnalyzer(QMainWindow):
             f"----------------------------------------\n"
             )
 
+    def detect_closed_cells(self):
+        """Shapely를 활용하여 단면 내의 폐쇄된 방(Cell)과 공유 격벽을 엄격하게 탐색합니다."""
+        from shapely.ops import polygonize, unary_union
+
+        self.cells_info = []
+        self.edge_to_cells = {e['id']: [] for e in self.graph_edges}
+
+        # 1. 1D 선분 기하학 추출 및 강제 결합 (미세한 틈새로 인해 루프가 인식되지 않는 현상 원천 차단)
+        lines = [e['geometry'] for e in self.graph_edges]
+        merged_lines = unary_union(lines)
+
+        # 2. 다각형(Cell) 생성
+        polygons = list(polygonize(merged_lines))
+
+        for i, poly in enumerate(polygons):
+            cell_id = i + 1
+            cell_area = poly.area
+            cell_edges = []
+
+            # 3. 폴리곤 경계(Boundary)에 포함되는 선분 식별
+            bound = poly.boundary
+            for eid, e in enumerate(self.graph_edges):
+                geom = e['geometry']
+                # 선분의 중간점(centroid)을 기준으로 검사하여 인식률 극대화 (허용 오차 1e-2)
+                if bound.distance(geom.centroid) < 1e-2 or bound.distance(geom) < 1e-2:
+                    cell_edges.append(eid)
+                    self.edge_to_cells[eid].append(cell_id)
+
+            self.cells_info.append({
+                'cell_id': cell_id,
+                'polygon': poly,
+                'area': cell_area,
+                'edges': cell_edges
+            })
+
         # =====================================================================
         # ✨ 첨부된 순서도(Flowchart)의 완벽한 논리 이식
         # =====================================================================
@@ -1785,15 +1820,19 @@ class UltimateShipAnalyzer(QMainWindow):
                     tau_s_actual = q_s_actual / thk
                     tau_e_actual = q_e_actual / thk
 
-                    info_text += (
-                        f"\n🔸 [해석 결과 (전단류 & 전단응력)]\n"
-                        f" - 실제 전단류 (시작): {q_s_actual:.2f} N/mm\n"
-                        f" - 실제 전단류 (끝점): {q_e_actual:.2f} N/mm\n"
-                        f"-------------------------------------\n"
-                        f" - 전단응력 τ (시작): {tau_s_actual:.2f} MPa (N/mm²)\n"
-                        f" - 전단응력 τ (끝점): {tau_e_actual:.2f} MPa (N/mm²)\n"
-                        f"   (※ 총 전단력 {user_vy:,.0f} N 반영 기준)"
-                    )
+                    if hasattr(self, 'edge_to_cells') and edge_id in self.edge_to_cells:
+                        belonging_cells = self.edge_to_cells[edge_id]
+                        if len(belonging_cells) == 0:
+                            shared_text = "일반 개단면 부재 (폐루프 미포함)"
+                        elif len(belonging_cells) == 1:
+                            shared_text = f"외판/독립 격벽 (Cell {belonging_cells[0]} 단독 소속)"
+                        else:
+                            shared_text = f"🔥 공유 격벽 (Shared Web) - Cell {belonging_cells} 사이 연결"
+
+                        info_text += (
+                            f"\n\n🟩 [위상수학적 셀(Cell) 정보]\n"
+                            f" - 소속 상태 : {shared_text}\n"
+                        )
 
                 from PySide6.QtWidgets import QMessageBox
                 QMessageBox.information(self, f"Edge ID: {edge_id}", info_text)
@@ -1844,6 +1883,18 @@ class UltimateShipAnalyzer(QMainWindow):
 
             # ✨ [도면 2: 수직 막대그래프형 전단응력 다이어그램]
             if hasattr(self, 'graph_edges'):
+                if hasattr(self, 'cells_info') and self.cells_info:
+                    for cinfo in self.cells_info:
+                        poly = cinfo['polygon']
+                        cid = cinfo['cell_id']
+
+                        # 방 한가운데에 Cell 번호 뱃지만 텍스트로 생성 (배경색 칠하기 생략)
+                        cx, cy = poly.centroid.x, poly.centroid.y
+                        ax2.annotate(f"Cell {cid}", (cx, cy),
+                                     color='black', weight='bold', fontsize=12,
+                                     ha='center', va='center', zorder=25,
+                                     bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="black", alpha=0.9, lw=1.5))
+
                 if hasattr(self, 'edge_q_results') and self.edge_q_results:
                     import matplotlib.colors as mcolors
                     import matplotlib.cm as cm
