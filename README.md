@@ -22,7 +22,7 @@ from matplotlib.ticker import FuncFormatter
 from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                                QPushButton, QLabel, QTextEdit, QFileDialog, QLineEdit,
                                QHBoxLayout, QScrollArea, QFrame, QSplitter, QComboBox,
-                               QInputDialog, QMessageBox, QProgressDialog, QRadioButton)
+                               QInputDialog, QMessageBox, QProgressDialog, QRadioButton,QDialog)
 from PySide6.QtGui import QTextCursor, QIcon
 from PySide6.QtCore import Qt
 
@@ -35,6 +35,73 @@ from collections import defaultdict, deque
 matplotlib.use('QtAgg')
 rcParams['font.family'] = 'Malgun Gothic'
 rcParams['axes.unicode_minus'] = False
+
+
+class SlitViewerDialog(QDialog):
+    def __init__(self, main_app, slit_nid):
+        super().__init__(main_app)
+        self.main_app = main_app
+        self.slit_nid = slit_nid
+        self.setWindowTitle(f"Slit Node {slit_nid} - Topology Inspector")
+        self.resize(700, 600)
+
+        layout = QVBoxLayout(self)
+
+        info_label = QLabel(
+            f"<b>Node {slit_nid} (Slit Position)</b><br>"
+            f"<span style='color:blue;'>실선(파란색)</span>: 현재 연결이 유지된 경로<br>"
+            f"<span style='color:red;'>점선(빨간색)</span>: 루프 탐지로 인해 절단된(Cut) 경로"
+        )
+        layout.addWidget(info_label)
+
+        # 팝업용 캔버스 생성
+        self.fig = Figure()
+        self.canvas = FigureCanvas(self.fig)
+        layout.addWidget(NavigationToolbar(self.canvas, self))
+        layout.addWidget(self.canvas)
+
+        self.plot_topology()
+
+    def plot_topology(self):
+        ax = self.fig.add_subplot(111)
+
+        # 1. 모든 노드와 연결된 부재들을 다시 한번 확실히 매핑
+        all_edges = self.main_app.graph_edges
+
+        # 2. 파란 실선 (연결 유지) 그리기
+        # remaining_edges_info에 있는 ID를 사용하여 전체 그래프 데이터에서 기하 정보를 가져옴
+        for eid, e in self.main_app.remaining_edges_info.items():
+            if e['u'] == self.slit_nid or e['v'] == self.slit_nid:
+                geom = all_edges[eid]['geometry']
+                ax.plot(*geom.xy, color='blue', linewidth=3, alpha=0.8, label='Connected')
+
+        # 3. 빨간 점선 (절단) 그리기
+        for cut_info in self.main_app.cut_edges_info:
+            # 잘린 부재는 cut_edges_info에 edge_id가 저장되어 있음
+            eid = cut_info['edge_id']
+            # 그 간선의 u, v가 현재 슬릿 노드와 관련이 있는지 확인
+            if cut_info['u'] == self.slit_nid or cut_info['v'] == self.slit_nid:
+                geom = all_edges[eid]['geometry']
+                ax.plot(*geom.xy, color='red', linewidth=3, linestyle='--', alpha=0.8, label='Cut (Slit)')
+
+        # 4. 노드 마커 그리기
+        # 슬릿 노드 좌표 가져오기
+        center_pt = self.main_app.graph_nodes[self.slit_nid]
+
+        # 슬릿 노드 강조
+        ax.scatter(center_pt[0], center_pt[1], color='lime', marker='*', s=300, edgecolors='black', zorder=10)
+        ax.annotate(f"Slit N{self.slit_nid}", (center_pt[0], center_pt[1]),
+                    xytext=(10, 10), textcoords='offset points', fontweight='bold')
+
+        ax.set_aspect('equal')
+        ax.grid(True, linestyle=':', alpha=0.6)
+
+        # 범례 중복 제거
+        handles, labels = ax.get_legend_handles_labels()
+        by_label = dict(zip(labels, handles))
+        ax.legend(by_label.values(), by_label.keys(), loc='best')
+
+        self.canvas.draw()
 
 
 class UltimateShipAnalyzer(QMainWindow):
@@ -204,6 +271,7 @@ class UltimateShipAnalyzer(QMainWindow):
             # ✨ 두 번째 캔버스(그래프 뷰)에 클릭 이벤트 핸들러 연결
             if i == 1:
                 can.mpl_connect('pick_event', self.on_edge_click)
+                can.mpl_connect('pick_event', self.on_slit_node_click)
 
         work_layout.addWidget(viz_splitter, stretch=7)
 
@@ -1538,11 +1606,15 @@ class UltimateShipAnalyzer(QMainWindow):
         # =====================================================================
         # ✨ 첨부된 순서도(Flowchart)의 완벽한 논리 이식
         # =====================================================================
+
     def execute_flowchart_algorithm(self):
         """순서도에 명시된 Free Node Pruning과 Loop Detection을 엄격하게 수행합니다."""
-        # 그래프 파괴를 동반하므로 복사본 생성
         working_edges = {e['id']: {'u': e['start_node'], 'v': e['end_node']} for e in self.graph_edges}
         slit_nodes_ids = []
+
+        # ✨ 새로 추가: 절단된 간선과 유지된 간선을 추적하기 위한 변수
+        self.cut_edges_info = []
+        self.remaining_edges_info = {}
 
         def get_degrees(edges_dict):
             deg = {}
@@ -1552,22 +1624,14 @@ class UltimateShipAnalyzer(QMainWindow):
             return deg
 
         while True:
-            # ---------------------------------------------------------
-            # [Phase 1: 좌측 순서도] 자유 노드 가지치기 (Prune Free Nodes)
-            # ---------------------------------------------------------
+            # [Phase 1: 좌측 순서도] 자유 노드 가지치기
             while True:
                 deg = get_degrees(working_edges)
                 free_nodes = [n for n, d in deg.items() if d == 1]
-
-                # "Is there a free node remaining? -> NO"
-                if not free_nodes:
-                    break
-
-                    # "Start a new path at any free node: i = Current node"
+                if not free_nodes: break
                 i = free_nodes[0]
 
                 while True:
-                    # "Check which member node 'i' belongs to: m = Current member"
                     m = None
                     for eid, e in working_edges.items():
                         if e['u'] == i or e['v'] == i:
@@ -1575,64 +1639,55 @@ class UltimateShipAnalyzer(QMainWindow):
                             break
                     if m is None: break
 
-                    # "Go from node 'i' to remaining node of member 'm': j = Next node"
                     j = working_edges[m]['v'] if working_edges[m]['u'] == i else working_edges[m]['u']
                     deg_j = get_degrees(working_edges).get(j, 0)
 
-                    # "Delete member 'm' and node 'i'"
+                    # 가지치기(단순 말단 제거)는 슬릿 생성과 다르므로 조용히 삭제
                     del working_edges[m]
 
-                    # 상태 판별
                     if deg_j == 1:
-                        # "Is node 'j' a free node? -> YES -> END (경로 중지)"
                         break
                     elif deg_j >= 3:
-                        # "Is node 'j' a bridge node? -> YES -> Stop path and start a new path"
                         break
                     else:
-                        # "Is node 'j' a bridge node? -> NO -> Assign 'j' as Current Node: i=j"
                         i = j
 
-                        # ---------------------------------------------------------
-            # [Phase 2: 우측 순서도] 루프 탐지 (Loop Detection & Cutting)
-            # ---------------------------------------------------------
+            # [Phase 2: 우측 순서도] 루프 탐지
             deg = get_degrees(working_edges)
             remaining_nodes = [n for n, d in deg.items() if d > 0]
 
-            # "Is there any node remaining? -> NO -> END"
-            if not remaining_nodes:
-                break
+            if not remaining_nodes: break
 
-                # "There is at least one loop. Start anywhere: i = Current node"
             i = remaining_nodes[0]
             visited_nodes = {i}
             visited_members = set()
 
             while True:
-                # "Choose any one of the unvisited member(s) node 'i' belongs to: m"
                 attached_edges = [eid for eid, e in working_edges.items() if
                                   (e['u'] == i or e['v'] == i) and eid not in visited_members]
-                if not attached_edges: break  # 예외 안전장치
+                if not attached_edges: break
 
                 m = attached_edges[0]
-                # "Mark member 'm' and node 'i' as visited"
                 visited_members.add(m)
 
-                # "Go from node 'i' to remaining node of member 'm': j = Next node"
                 j = working_edges[m]['v'] if working_edges[m]['u'] == i else working_edges[m]['u']
 
-                # "Is 'j' a previously visited node?"
                 if j in visited_nodes:
-                    # "YES -> New Loop Found. Cut the newly found loop at any node"
+                    # ✨ [수정됨] 루프가 발견되어 부재를 절단(Slit)할 때 해당 정보 저장
                     slit_nodes_ids.append(j)
-                    del working_edges[m]  # 슬릿 생성(해당 부재 절단)
-                    break  # 루프가 끊어졌으므로 다시 좌측(Phase 1)으로 돌아감
+                    self.cut_edges_info.append({
+                        'edge_id': m,
+                        'u': working_edges[m]['u'],
+                        'v': working_edges[m]['v']
+                    })
+                    del working_edges[m]
+                    break
                 else:
-                    # "NO -> Assign 'j' as the Current Node: i = j"
                     visited_nodes.add(j)
                     i = j
 
         self.flowchart_slit_nodes = list(set(slit_nodes_ids))
+        self.remaining_edges_info = working_edges  # 최종적으로 살아남은 위상 경로 저장
 
     def on_edge_click(self, event):
         """그래프 선분 클릭 시 정보를 표시하는 이벤트 핸들러"""
@@ -1652,6 +1707,16 @@ class UltimateShipAnalyzer(QMainWindow):
                 )
                 from PySide6.QtWidgets import QMessageBox
                 QMessageBox.information(self, f"Edge ID: {edge_id}", info_text)
+
+    def on_slit_node_click(self, event):
+        """슬릿 노드(별모양) 클릭 시 위상 팝업창을 띄우는 이벤트 핸들러"""
+        if event.artist and hasattr(event.artist, 'get_gid'):
+            gid = event.artist.get_gid()
+            if gid is not None and str(gid).startswith("slit_"):
+                nid = int(str(gid).split("_")[1])
+                # 팝업 띄우기
+                dialog = SlitViewerDialog(self, nid)
+                dialog.exec()
 
     def refresh_ui(self):
         self.fig1.clear()
@@ -1700,12 +1765,16 @@ class UltimateShipAnalyzer(QMainWindow):
 
                 # ✨ 새로 추가된 부분: 알고리즘에 의해 도출된 슬릿 노드 특별 시각화
                 if hasattr(self, 'flowchart_slit_nodes') and self.flowchart_slit_nodes:
-                    slit_xs = [self.graph_nodes[nid][0] for nid in self.flowchart_slit_nodes]
-                    slit_ys = [self.graph_nodes[nid][1] for nid in self.flowchart_slit_nodes]
+                    for i, nid in enumerate(self.flowchart_slit_nodes):
+                        pt = self.graph_nodes[nid]
+                        # 범례(Legend)는 첫 번째 마커에만 표시되도록 라벨 부여
+                        label = 'Slit Position (Cut Node)' if i == 0 else ""
 
-                    # 눈에 잘 띄도록 밝은 연두색의 거대한 별모양(*) 마커 적용
-                    ax2.scatter(slit_xs, slit_ys, color='lime', marker='*', s=250,
-                                zorder=30, edgecolors='black', label='Slit Position (Cut Node)')
+                        # 개별적으로 scatter를 그려서 클릭(picker) 가능하게 만듦
+                        ax2.scatter(pt[0], pt[1], color='lime', marker='*', s=250,
+                                    zorder=30, edgecolors='black', picker=5,
+                                    gid=f"slit_{nid}", label=label)
+
                     ax2.legend(loc='upper right')
 
         else:
