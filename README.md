@@ -1842,7 +1842,7 @@ class UltimateShipAnalyzer(QMainWindow):
                             pass
                     ax1.plot(*lo.xy, color=final_color, linewidth=2.0, alpha=0.9, zorder=10)
 
-            # ✨ [도면 2: 전단응력(Shear Stress) 히트맵]
+            # ✨ [도면 2: 수직 막대그래프형 전단응력 다이어그램]
             if hasattr(self, 'graph_edges'):
                 if hasattr(self, 'edge_q_results') and self.edge_q_results:
                     import matplotlib.colors as mcolors
@@ -1851,7 +1851,7 @@ class UltimateShipAnalyzer(QMainWindow):
                     max_tau = 1e-9
                     user_vy = getattr(self, 'user_Vy_total', 1000000.0)
 
-                    # ✨ 부재 두께를 고려한 '최대 전단응력' 탐색
+                    # 최대 전단응력 계산
                     for eid, sub_list in self.edge_q_results.items():
                         thk = self.graph_edges[eid]['thickness']
                         for chunk in sub_list:
@@ -1859,23 +1859,91 @@ class UltimateShipAnalyzer(QMainWindow):
                             tau_end = abs(chunk['q_end_unit'] * user_vy / thk)
                             max_tau = max(max_tau, tau_start, tau_end)
 
+                    # ✨ 화면 스케일 계산: 선체 높이/너비의 5% 정도를 최대 응력의 시각적 두께로 변환
+                    nodes_arr = np.array(list(self.graph_nodes.values()))
+                    if len(nodes_arr) > 0:
+                        max_dim = max(nodes_arr[:, 0].max() - nodes_arr[:, 0].min(),
+                                      nodes_arr[:, 1].max() - nodes_arr[:, 1].min())
+                    else:
+                        max_dim = 10000.0
+
+                    visual_scale = (max_dim * 0.05) / max_tau if max_tau > 1e-9 else 1.0
+
                     cmap = cm.turbo
                     norm = mcolors.Normalize(vmin=0, vmax=max_tau)
 
-                    # 300mm 단위로 쪼개진 곡선 조각들을 응력 그라데이션으로 렌더링
+                    # 수직 막대(다각형) 렌더링
                     for eid, edge_data in enumerate(self.graph_edges):
                         res_list = self.edge_q_results.get(eid)
                         thk = edge_data['thickness']
                         if res_list:
                             for chunk in res_list:
                                 sub_geom = chunk['geom']
-                                # 전단류 단위를 전단응력(MPa)으로 변환
-                                q_mid_unit = abs((chunk['q_start_unit'] + chunk['q_end_unit']) / 2.0)
-                                tau_mid = (q_mid_unit * user_vy) / thk
+                                is_fwd = chunk.get('is_forward', True)
+
+                                tau_s = (chunk['q_start_unit'] * user_vy) / thk
+                                tau_e = (chunk['q_end_unit'] * user_vy) / thk
 
                                 c = np.array(sub_geom.coords)
-                                ax2.plot(c[:, 0], c[:, 1], color=cmap(norm(tau_mid)),
-                                         linewidth=3.5, zorder=10, picker=5, gid=f"edge_{eid}")
+                                num_pts = len(c)
+
+                                # 기하학 방향과 수치 배열 동기화
+                                if is_fwd:
+                                    taus = np.linspace(tau_s, tau_e, num_pts)
+                                else:
+                                    taus = np.linspace(tau_e, tau_s, num_pts)
+
+                                    # ====================================================================
+                                    # ✨ 수직 방향 엄격화: 선분 전체가 아닌 각 점(Point)마다 완벽한 직교 벡터 도출
+                                    # ====================================================================
+                                n_vecs = np.zeros_like(c)
+                                for p_idx in range(num_pts):
+                                    # 1. 접선(Tangent) 벡터 계산
+                                    if num_pts == 2:
+                                        tg = c[1] - c[0]
+                                    elif p_idx == 0:
+                                        tg = c[1] - c[0]  # 전진 차분
+                                    elif p_idx == num_pts - 1:
+                                        tg = c[-1] - c[-2]  # 후진 차분
+                                    else:
+                                        # 곡선부를 위한 중심 차분법(Central Difference): 양옆 점을 이은 완만한 접선
+                                        tg = c[p_idx + 1] - c[p_idx - 1]
+
+                                        # 2. 크기를 1로 정규화(Normalize)하고 90도 회전
+                                    tg_len = np.linalg.norm(tg)
+                                    if tg_len > 1e-6:
+                                        tg = tg / tg_len
+                                        # 반시계 방향 90도 직교 벡터 산출
+                                        n_vecs[p_idx] = np.array([-tg[1], tg[0]])
+                                    else:
+                                        n_vecs[p_idx] = np.array([0, 1])
+
+                                # 수직 돌출부 (막대의 상단 라인): 각 점마다 자신의 고유한 법선 벡터를 따라 돌출됨
+                                top_pts = c + n_vecs * (taus[:, np.newaxis] * visual_scale)
+
+                                # 다각형 좌표 결합 (바닥선 -> 상단 역방향)
+                                poly_x = list(c[:, 0]) + list(top_pts[::-1, 0])
+                                poly_y = list(c[:, 1]) + list(top_pts[::-1, 1])
+                                # ====================================================================
+
+                                tau_mid_abs = abs((tau_s + tau_e) / 2.0)
+                                face_color = cmap(norm(tau_mid_abs))
+
+                                # 1. 막대 내부 색상 칠하기 (반투명)
+                                ax2.fill(poly_x, poly_y, color=face_color, alpha=0.5, edgecolor='none', zorder=8)
+
+                                # 2. 막대 외곽선(상단) 그리기
+                                ax2.plot(top_pts[:, 0], top_pts[:, 1], color=face_color, linewidth=1.5, zorder=9)
+
+                                # 3. 막대그래프 구획 해치(Hatch)선 그리기
+                                ax2.plot([c[0, 0], top_pts[0, 0]], [c[0, 1], top_pts[0, 1]],
+                                         color=face_color, linewidth=0.8, alpha=0.7, zorder=9)
+                                ax2.plot([c[-1, 0], top_pts[-1, 0]], [c[-1, 1], top_pts[-1, 1]],
+                                         color=face_color, linewidth=0.8, alpha=0.7, zorder=9)
+
+                                # 4. 기준선(Base line)은 검은색으로 고정하여 구조물 뼈대 강조 (클릭 이벤트 포함)
+                                ax2.plot(c[:, 0], c[:, 1], color='black', linewidth=1.5, zorder=10, picker=5,
+                                         gid=f"edge_{eid}")
                         else:
                             geom = edge_data['geometry']
                             ax2.plot(*geom.xy, color='dodgerblue', linewidth=2.5, alpha=0.8,
@@ -1889,11 +1957,12 @@ class UltimateShipAnalyzer(QMainWindow):
                             geom = self.graph_edges[eid]['geometry']
                             ax2.plot(*geom.xy, color='#BDC3C7', linewidth=2.5, linestyle='--', zorder=5)
 
-                    # 컬러바 축 생성 (단위 MPa 명시)
+                    # 컬러바 축 생성
                     sm = plt.cm.ScalarMappable(cmap=cmap, norm=norm)
                     sm.set_array([])
                     self.cbar = self.fig2.colorbar(sm, ax=ax2, fraction=0.046, pad=0.04)
 
+                    user_vy = getattr(self, 'user_Vy_total', 0)
                     label_text = f'Shear Stress |τ_d| (MPa)\n[Total Vy = {user_vy:,.0f} N 적용]'
                     self.cbar.set_label(label_text, fontweight='bold', fontsize=10)
 
@@ -2077,7 +2146,7 @@ class UltimateShipAnalyzer(QMainWindow):
 
                         j_next = edges[m]['v'] if edges[m]['u'] == i_curr else edges[m]['u']
 
-                        # ✨ 곡선 기하학 및 진행 방향 판별
+                        # 곡선 기하학 및 진행 방향 판별
                         geom = self.graph_edges[m]['geometry']
                         thk = self.graph_edges[m]['thickness']
                         coord_u = nodes[i_curr]
@@ -2088,7 +2157,7 @@ class UltimateShipAnalyzer(QMainWindow):
                         dist_to_end = np.hypot(coord_u[0] - geom_end[0], coord_u[1] - geom_end[1])
                         is_forward = dist_to_start < dist_to_end
 
-                        # ✨ 300mm 단위로 곡선 경로 분할 계산
+                        # 300mm 단위로 곡선 경로 분할 계산
                         L_total = geom.length
                         num_chunks = max(1, int(np.ceil(L_total / 300.0)))
 
@@ -2104,19 +2173,18 @@ class UltimateShipAnalyzer(QMainWindow):
                             sub_geom = substring(geom, min(d1, d2), max(d1, d2))
                             if sub_geom.length < 1e-6: continue
 
-                            # 해당 분할 구간의 단면적 및 도심 계산
                             A_sub = sub_geom.length * thk
                             y_bar = sub_geom.centroid.y - na_y
                             dS_z = A_sub * y_bar
 
-                            # 단위 힘에 대한 전단류 (1/mm) = (V_half / V_total) / I_xx * dS_z = 0.5 / I_xx * dS_z
                             dq_unit = - (0.5 / ixx) * dS_z
                             q_next_unit = q_curr_unit + dq_unit
 
                             sub_results.append({
                                 'geom': sub_geom,
                                 'q_start_unit': q_curr_unit,
-                                'q_end_unit': q_next_unit
+                                'q_end_unit': q_next_unit,
+                                'is_forward': is_forward  # ✨ 렌더링 방향 일치를 위해 플래그 저장 추가
                             })
                             q_curr_unit = q_next_unit
 
@@ -2130,7 +2198,7 @@ class UltimateShipAnalyzer(QMainWindow):
                         if nm[j_next] == 1 or nm[j_next] >= 3:
                             break
 
-            # [Phase 2] 교차점 슈퍼포지션 (Phase 1과 동일한 300mm 곡선 분할 로직 적용)
+            # [Phase 2] 교차점 슈퍼포지션
             if not path_started:
                 bridge_started = False
                 for n, deg in nm.items():
@@ -2192,7 +2260,8 @@ class UltimateShipAnalyzer(QMainWindow):
                                     sub_results.append({
                                         'geom': sub_geom,
                                         'q_start_unit': q_curr_unit,
-                                        'q_end_unit': q_next_unit
+                                        'q_end_unit': q_next_unit,
+                                        'is_forward': is_forward  # ✨ 렌더링 방향 일치를 위해 플래그 저장 추가
                                     })
                                     q_curr_unit = q_next_unit
 
@@ -2209,7 +2278,6 @@ class UltimateShipAnalyzer(QMainWindow):
                 if not bridge_started:
                     break
 
-        # UI 및 클릭 이벤트를 위해 총 전단력 저장
         self.user_Vy_total = Vy_total
 
 
