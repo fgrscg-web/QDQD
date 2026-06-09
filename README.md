@@ -245,8 +245,10 @@ class UltimateShipAnalyzer(QMainWindow):
         gen_box.setObjectName("settingBox")
         gen_vbox = QVBoxLayout(gen_box)
         gen_vbox.addWidget(QLabel("<b>[General Settings]</b>"))
+
+        # ✨ "Total Vy (t):" 로 단위 변경, 기본값 100(톤)으로 설정
         for lbl, attr, dval in [("Scale:", "txt_scale", "100"), ("H-Ext (mm):", "txt_ext", "10"),
-                                ("V-Ext (mm):", "txt_perp", "10")]:
+                                ("V-Ext (mm):", "txt_perp", "10"), ("Total Vy (t):", "txt_vy", "100")]:
             h = QHBoxLayout()
             h.addWidget(QLabel(lbl))
             h.addStretch()
@@ -1383,24 +1385,23 @@ class UltimateShipAnalyzer(QMainWindow):
             progress.setLabelText("Executing Flowchart Algorithm...")
             self.execute_flowchart_algorithm()
 
-            Vy_input, ok = QInputDialog.getDouble(
-                self,
-                "총 전단력 입력 (Total Shear Force)",
-                "전체 단면에 작용하는 총 수직 전단력(Vy)을 입력하세요 (단위: N):\n(※ 입력된 값의 50%가 반단면 해석에 자동 적용됩니다.)",
-                1000000.0, 0.0, 1e12, 2
-            )
-            if not ok:
-                Vy_input = 1000000.0  # 취소 시 기본값 1000kN
+            # ✨ 팝업창 대신 General Settings의 텍스트 상자에서 전단력 가져오기
+            try:
+                Vy_input_t = float(self.txt_vy.text().strip())
+                # 1 ton(t) = 9806.65 N 으로 변환 (응력 및 전단류 단위 N/mm 연동을 위함)
+                Vy_input_N = Vy_input_t * 9806.65
+
+            except ValueError:
+                # 임의의 값 대신 경고 팝업창을 띄우고 변환 프로세스 즉시 중단
+                progress.close()
+                self.is_processing = False
+                self.btn_calc.setEnabled(True)
+                self.btn_load.setEnabled(True)
+                QMessageBox.warning(self, "입력 오류", "전단력(Total Vy)에는 유효한 숫자(t 단위)를 입력해야 합니다.\n계산을 중단합니다.")
+                return
 
             progress.setLabelText("Calculating Determinate Shear Flow...")
-            self.calculate_determinate_shear_flow(Vy_total=Vy_input)
-            QApplication.processEvents()
-
-            progress.setLabelText("Calculating Section Properties...")
-            progress.setValue(99)
-
-            progress.setLabelText("Calculating Determinate Shear Flow...")
-            self.calculate_determinate_shear_flow()
+            self.calculate_determinate_shear_flow(Vy_total=Vy_input_N)
             QApplication.processEvents()
 
             progress.setLabelText("Calculating Section Properties...")
@@ -1769,23 +1770,29 @@ class UltimateShipAnalyzer(QMainWindow):
                     f" - 길이(L)   : {edge['length']:,.2f} mm\n"
                 )
 
-                # ✨ 300mm 단위로 쪼개진 전단류 계산 결과 상세 정보 추가
+                # ✨ 300mm 단위로 쪼개진 전단류 및 전단응력 계산 결과 상세 정보 추가
                 if hasattr(self, 'edge_q_results') and edge_id in self.edge_q_results:
                     chunks = self.edge_q_results[edge_id]
                     q_s_unit = chunks[0]['q_start_unit']
                     q_e_unit = chunks[-1]['q_end_unit']
 
-                    q_s_actual = q_s_unit * getattr(self, 'user_Vy_total', 1000000.0)
-                    q_e_actual = q_e_unit * getattr(self, 'user_Vy_total', 1000000.0)
+                    user_vy = getattr(self, 'user_Vy_total', 1000000.0)
+                    q_s_actual = q_s_unit * user_vy
+                    q_e_actual = q_e_unit * user_vy
+
+                    # 전단류(N/mm) / 두께(mm) = 전단응력(MPa)
+                    thk = edge['thickness']
+                    tau_s_actual = q_s_actual / thk
+                    tau_e_actual = q_e_actual / thk
 
                     info_text += (
-                        f"\n🔸 [정전단류(q_d) 해석 결과]\n"
-                        f" - 단위 전단류 (시작): {q_s_unit:.4e} 1/mm\n"
-                        f" - 단위 전단류 (끝점): {q_e_unit:.4e} 1/mm\n"
-                        f"-------------------------------------\n"
+                        f"\n🔸 [해석 결과 (전단류 & 전단응력)]\n"
                         f" - 실제 전단류 (시작): {q_s_actual:.2f} N/mm\n"
                         f" - 실제 전단류 (끝점): {q_e_actual:.2f} N/mm\n"
-                        f"   (※ 총 전단력 {getattr(self, 'user_Vy_total', 0):,.0f} N 반영 기준)"
+                        f"-------------------------------------\n"
+                        f" - 전단응력 τ (시작): {tau_s_actual:.2f} MPa (N/mm²)\n"
+                        f" - 전단응력 τ (끝점): {tau_e_actual:.2f} MPa (N/mm²)\n"
+                        f"   (※ 총 전단력 {user_vy:,.0f} N 반영 기준)"
                     )
 
                 from PySide6.QtWidgets import QMessageBox
@@ -1835,29 +1842,39 @@ class UltimateShipAnalyzer(QMainWindow):
                             pass
                     ax1.plot(*lo.xy, color=final_color, linewidth=2.0, alpha=0.9, zorder=10)
 
-            # ✨ [도면 2: 1/mm 단위 전단류 히트맵]
+            # ✨ [도면 2: 전단응력(Shear Stress) 히트맵]
             if hasattr(self, 'graph_edges'):
                 if hasattr(self, 'edge_q_results') and self.edge_q_results:
                     import matplotlib.colors as mcolors
                     import matplotlib.cm as cm
 
-                    max_q_unit = 1e-9
-                    for sub_list in self.edge_q_results.values():
+                    max_tau = 1e-9
+                    user_vy = getattr(self, 'user_Vy_total', 1000000.0)
+
+                    # ✨ 부재 두께를 고려한 '최대 전단응력' 탐색
+                    for eid, sub_list in self.edge_q_results.items():
+                        thk = self.graph_edges[eid]['thickness']
                         for chunk in sub_list:
-                            max_q_unit = max(max_q_unit, abs(chunk['q_start_unit']), abs(chunk['q_end_unit']))
+                            tau_start = abs(chunk['q_start_unit'] * user_vy / thk)
+                            tau_end = abs(chunk['q_end_unit'] * user_vy / thk)
+                            max_tau = max(max_tau, tau_start, tau_end)
 
                     cmap = cm.turbo
-                    norm = mcolors.Normalize(vmin=0, vmax=max_q_unit)
+                    norm = mcolors.Normalize(vmin=0, vmax=max_tau)
 
-                    # 300mm 단위로 쪼개진 곡선 조각들을 그라데이션으로 렌더링
+                    # 300mm 단위로 쪼개진 곡선 조각들을 응력 그라데이션으로 렌더링
                     for eid, edge_data in enumerate(self.graph_edges):
                         res_list = self.edge_q_results.get(eid)
+                        thk = edge_data['thickness']
                         if res_list:
                             for chunk in res_list:
                                 sub_geom = chunk['geom']
-                                q_mid = abs((chunk['q_start_unit'] + chunk['q_end_unit']) / 2.0)
+                                # 전단류 단위를 전단응력(MPa)으로 변환
+                                q_mid_unit = abs((chunk['q_start_unit'] + chunk['q_end_unit']) / 2.0)
+                                tau_mid = (q_mid_unit * user_vy) / thk
+
                                 c = np.array(sub_geom.coords)
-                                ax2.plot(c[:, 0], c[:, 1], color=cmap(norm(q_mid)),
+                                ax2.plot(c[:, 0], c[:, 1], color=cmap(norm(tau_mid)),
                                          linewidth=3.5, zorder=10, picker=5, gid=f"edge_{eid}")
                         else:
                             geom = edge_data['geometry']
@@ -1872,13 +1889,12 @@ class UltimateShipAnalyzer(QMainWindow):
                             geom = self.graph_edges[eid]['geometry']
                             ax2.plot(*geom.xy, color='#BDC3C7', linewidth=2.5, linestyle='--', zorder=5)
 
-                    # 컬러바 축 생성 (단위 명시)
+                    # 컬러바 축 생성 (단위 MPa 명시)
                     sm = plt.cm.ScalarMappable(cmap=cmap, norm=norm)
                     sm.set_array([])
                     self.cbar = self.fig2.colorbar(sm, ax=ax2, fraction=0.046, pad=0.04)
 
-                    user_vy = getattr(self, 'user_Vy_total', 0)
-                    label_text = f'Unit Shear Flow |q_d| (1/mm)\n[Total Vy = {user_vy:,.0f} N 적용]'
+                    label_text = f'Shear Stress |τ_d| (MPa)\n[Total Vy = {user_vy:,.0f} N 적용]'
                     self.cbar.set_label(label_text, fontweight='bold', fontsize=10)
 
                 else:
