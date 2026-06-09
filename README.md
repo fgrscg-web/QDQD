@@ -64,42 +64,67 @@ class SlitViewerDialog(QDialog):
 
     def plot_topology(self):
         ax = self.fig.add_subplot(111)
-
-        # 1. 모든 노드와 연결된 부재들을 다시 한번 확실히 매핑
         all_edges = self.main_app.graph_edges
 
-        # 2. 파란 실선 (연결 유지) 그리기
-        # remaining_edges_info에 있는 ID를 사용하여 전체 그래프 데이터에서 기하 정보를 가져옴
+        connected_nodes = set()
+        dummy_nodes = set()
+
+        # 1. 파란 실선 (연결 유지) 그리기 및 인접 노드 추적
         for eid, e in self.main_app.remaining_edges_info.items():
             if e['u'] == self.slit_nid or e['v'] == self.slit_nid:
                 geom = all_edges[eid]['geometry']
-                ax.plot(*geom.xy, color='blue', linewidth=3, alpha=0.8, label='Connected')
+                ax.plot(*geom.xy, color='blue', linewidth=3, alpha=0.8, label='Connected (연결됨)')
 
-        # 3. 빨간 점선 (절단) 그리기
+                # 원본 슬릿 노드와 이어져 있는 반대쪽 인접 노드 식별
+                adj_nid = e['v'] if e['u'] == self.slit_nid else e['u']
+                connected_nodes.add(adj_nid)
+
+        # 2. 빨간 점선 (절단/분리) 그리기
         for cut_info in self.main_app.cut_edges_info:
-            # 잘린 부재는 cut_edges_info에 edge_id가 저장되어 있음
-            eid = cut_info['edge_id']
-            # 그 간선의 u, v가 현재 슬릿 노드와 관련이 있는지 확인
-            if cut_info['u'] == self.slit_nid or cut_info['v'] == self.slit_nid:
+            if cut_info['original_nid'] == self.slit_nid:
+                eid = cut_info['edge_id']
                 geom = all_edges[eid]['geometry']
-                ax.plot(*geom.xy, color='red', linewidth=3, linestyle='--', alpha=0.8, label='Cut (Slit)')
+                ax.plot(*geom.xy, color='red', linewidth=3, linestyle='--', alpha=0.8, label='Cut (분리됨)')
 
-        # 4. 노드 마커 그리기
-        # 슬릿 노드 좌표 가져오기
+                # 끊어져 나간 더미 노드 식별
+                dummy_nodes.add(cut_info['dummy_nid'])
+
+        # ========================================================
+        # 3. 노드 마커 및 정보 라벨 그리기
+        # ========================================================
+
+        # A. 메인 슬릿 노드
         center_pt = self.main_app.graph_nodes[self.slit_nid]
+        ax.scatter(center_pt[0], center_pt[1], color='lime', marker='*', s=400, edgecolors='black', zorder=10)
+        ax.annotate(f"Slit N{self.slit_nid}\n(Main)", (center_pt[0], center_pt[1]),
+                    xytext=(12, 12), textcoords='offset points', fontweight='bold', color='green')
 
-        # 슬릿 노드 강조
-        ax.scatter(center_pt[0], center_pt[1], color='lime', marker='*', s=300, edgecolors='black', zorder=10)
-        ax.annotate(f"Slit N{self.slit_nid}", (center_pt[0], center_pt[1]),
-                    xytext=(10, 10), textcoords='offset points', fontweight='bold')
+        # B. 유지된 인접 노드들
+        for nid in connected_nodes:
+            if nid == self.slit_nid: continue
+            pt = self.main_app.graph_nodes[nid]
+            ax.scatter(pt[0], pt[1], color='blue', marker='o', s=100, edgecolors='black', zorder=5)
+            ax.annotate(f"N{nid}\n(Adjacent)", (pt[0], pt[1]),
+                        xytext=(8, -15), textcoords='offset points', color='blue', fontsize=9)
+
+        # C. 절단되어 새로 생성된 더미 노드들
+        for nid in dummy_nodes:
+            pt = self.main_app.graph_nodes[nid]
+            # 좌표가 원본과 100% 동일하므로 구분을 위해 팝업창에서만 시각적으로 살짝 빗겨나게 표시(Offset)
+            offset_x, offset_y = 10.0, 10.0
+            ax.scatter(pt[0] + offset_x, pt[1] + offset_y, color='red', marker='X', s=150, edgecolors='black',
+                       zorder=10)
+            ax.annotate(f"N{nid}\n(Dummy)", (pt[0] + offset_x, pt[1] + offset_y),
+                        xytext=(10, 5), textcoords='offset points', color='red', fontweight='bold', fontsize=9)
 
         ax.set_aspect('equal')
         ax.grid(True, linestyle=':', alpha=0.6)
 
-        # 범례 중복 제거
+        # 범례 중복 방지
         handles, labels = ax.get_legend_handles_labels()
         by_label = dict(zip(labels, handles))
-        ax.legend(by_label.values(), by_label.keys(), loc='best')
+        if by_label:
+            ax.legend(by_label.values(), by_label.keys(), loc='best')
 
         self.canvas.draw()
 
@@ -1609,10 +1634,14 @@ class UltimateShipAnalyzer(QMainWindow):
 
     def execute_flowchart_algorithm(self):
         """순서도에 명시된 Free Node Pruning과 Loop Detection을 엄격하게 수행합니다."""
-        working_edges = {e['id']: {'u': e['start_node'], 'v': e['end_node']} for e in self.graph_edges}
-        slit_nodes_ids = []
 
-        # ✨ 새로 추가: 절단된 간선과 유지된 간선을 추적하기 위한 변수
+        # 1. 시뮬레이션용 복사본 (알고리즘 정상 종료를 위해 파괴될 가상 그래프)
+        sim_edges = {e['id']: {'u': e['start_node'], 'v': e['end_node']} for e in self.graph_edges}
+
+        # 2. 실제 보존될 최종 그래프 (더미 노드 생성 및 부재 보존용)
+        working_edges = {e['id']: {'u': e['start_node'], 'v': e['end_node']} for e in self.graph_edges}
+
+        slit_nodes_ids = []
         self.cut_edges_info = []
         self.remaining_edges_info = {}
 
@@ -1624,26 +1653,26 @@ class UltimateShipAnalyzer(QMainWindow):
             return deg
 
         while True:
-            # [Phase 1: 좌측 순서도] 자유 노드 가지치기
+            # [Phase 1: 좌측 순서도] 자유 노드 가지치기 (가상 그래프에서만 삭제)
             while True:
-                deg = get_degrees(working_edges)
+                deg = get_degrees(sim_edges)
                 free_nodes = [n for n, d in deg.items() if d == 1]
                 if not free_nodes: break
                 i = free_nodes[0]
 
                 while True:
                     m = None
-                    for eid, e in working_edges.items():
+                    for eid, e in sim_edges.items():
                         if e['u'] == i or e['v'] == i:
                             m = eid
                             break
                     if m is None: break
 
-                    j = working_edges[m]['v'] if working_edges[m]['u'] == i else working_edges[m]['u']
-                    deg_j = get_degrees(working_edges).get(j, 0)
+                    j = sim_edges[m]['v'] if sim_edges[m]['u'] == i else sim_edges[m]['u']
+                    deg_j = get_degrees(sim_edges).get(j, 0)
 
-                    # 가지치기(단순 말단 제거)는 슬릿 생성과 다르므로 조용히 삭제
-                    del working_edges[m]
+                    # 시뮬레이션 그래프에서는 완전 삭제하여 무한 루프 방지
+                    del sim_edges[m]
 
                     if deg_j == 1:
                         break
@@ -1652,8 +1681,8 @@ class UltimateShipAnalyzer(QMainWindow):
                     else:
                         i = j
 
-            # [Phase 2: 우측 순서도] 루프 탐지
-            deg = get_degrees(working_edges)
+            # [Phase 2: 우측 순서도] 루프 탐지 및 실제 슬릿(더미 노드) 생성
+            deg = get_degrees(sim_edges)
             remaining_nodes = [n for n, d in deg.items() if d > 0]
 
             if not remaining_nodes: break
@@ -1663,31 +1692,45 @@ class UltimateShipAnalyzer(QMainWindow):
             visited_members = set()
 
             while True:
-                attached_edges = [eid for eid, e in working_edges.items() if
+                attached_edges = [eid for eid, e in sim_edges.items() if
                                   (e['u'] == i or e['v'] == i) and eid not in visited_members]
                 if not attached_edges: break
 
                 m = attached_edges[0]
                 visited_members.add(m)
 
-                j = working_edges[m]['v'] if working_edges[m]['u'] == i else working_edges[m]['u']
+                j = sim_edges[m]['v'] if sim_edges[m]['u'] == i else sim_edges[m]['u']
 
                 if j in visited_nodes:
-                    # ✨ [수정됨] 루프가 발견되어 부재를 절단(Slit)할 때 해당 정보 저장
+                    # ✨ 루프 발견! 기록 및 실제 그래프(working_edges) 분리 작업 수행
                     slit_nodes_ids.append(j)
+
+                    # 1. 원본 노드와 동일한 좌표를 갖는 새로운 식별 번호(Dummy Node) 생성
+                    new_nid = max(self.graph_nodes.keys()) + 1
+                    self.graph_nodes[new_nid] = self.graph_nodes[j]
+
+                    # 2. 실제 보존될 그래프의 간선 끝점을 새로운 더미 노드로 갈아끼워 분리
+                    if working_edges[m]['u'] == j:
+                        working_edges[m]['u'] = new_nid
+                    else:
+                        working_edges[m]['v'] = new_nid
+
+                    # 3. 팝업창 가시화를 위한 정보 저장
                     self.cut_edges_info.append({
                         'edge_id': m,
-                        'u': working_edges[m]['u'],
-                        'v': working_edges[m]['v']
+                        'original_nid': j,
+                        'dummy_nid': new_nid
                     })
-                    del working_edges[m]
+
+                    # 🚨 시뮬레이션 그래프(sim_edges)에서는 해당 간선을 파괴하여 탐색 종료 유도
+                    del sim_edges[m]
                     break
                 else:
                     visited_nodes.add(j)
                     i = j
 
         self.flowchart_slit_nodes = list(set(slit_nodes_ids))
-        self.remaining_edges_info = working_edges  # 최종적으로 살아남은 위상 경로 저장
+        self.remaining_edges_info = working_edges  # 더미 노드가 완벽히 분리된 최종 그래프
 
     def on_edge_click(self, event):
         """그래프 선분 클릭 시 정보를 표시하는 이벤트 핸들러"""
