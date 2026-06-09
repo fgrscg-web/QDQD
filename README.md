@@ -1383,6 +1383,26 @@ class UltimateShipAnalyzer(QMainWindow):
             progress.setLabelText("Executing Flowchart Algorithm...")
             self.execute_flowchart_algorithm()
 
+            Vy_input, ok = QInputDialog.getDouble(
+                self,
+                "총 전단력 입력 (Total Shear Force)",
+                "전체 단면에 작용하는 총 수직 전단력(Vy)을 입력하세요 (단위: N):\n(※ 입력된 값의 50%가 반단면 해석에 자동 적용됩니다.)",
+                1000000.0, 0.0, 1e12, 2
+            )
+            if not ok:
+                Vy_input = 1000000.0  # 취소 시 기본값 1000kN
+
+            progress.setLabelText("Calculating Determinate Shear Flow...")
+            self.calculate_determinate_shear_flow(Vy_total=Vy_input)
+            QApplication.processEvents()
+
+            progress.setLabelText("Calculating Section Properties...")
+            progress.setValue(99)
+
+            progress.setLabelText("Calculating Determinate Shear Flow...")
+            self.calculate_determinate_shear_flow()
+            QApplication.processEvents()
+
             progress.setLabelText("Calculating Section Properties...")
             progress.setValue(99)
             QApplication.processEvents()
@@ -1746,8 +1766,28 @@ class UltimateShipAnalyzer(QMainWindow):
                     f" - 시작 노드 : Node {edge['start_node']} (X: {edge['start_coord'][0]:.1f}, Y: {edge['start_coord'][1]:.1f})\n"
                     f" - 끝 노드   : Node {edge['end_node']} (X: {edge['end_coord'][0]:.1f}, Y: {edge['end_coord'][1]:.1f})\n"
                     f" - 두께(t)   : {edge['thickness']} mm\n"
-                    f" - 길이(L)   : {edge['length']:,.2f} mm"
+                    f" - 길이(L)   : {edge['length']:,.2f} mm\n"
                 )
+
+                # ✨ 300mm 단위로 쪼개진 전단류 계산 결과 상세 정보 추가
+                if hasattr(self, 'edge_q_results') and edge_id in self.edge_q_results:
+                    chunks = self.edge_q_results[edge_id]
+                    q_s_unit = chunks[0]['q_start_unit']
+                    q_e_unit = chunks[-1]['q_end_unit']
+
+                    q_s_actual = q_s_unit * getattr(self, 'user_Vy_total', 1000000.0)
+                    q_e_actual = q_e_unit * getattr(self, 'user_Vy_total', 1000000.0)
+
+                    info_text += (
+                        f"\n🔸 [정전단류(q_d) 해석 결과]\n"
+                        f" - 단위 전단류 (시작): {q_s_unit:.4e} 1/mm\n"
+                        f" - 단위 전단류 (끝점): {q_e_unit:.4e} 1/mm\n"
+                        f"-------------------------------------\n"
+                        f" - 실제 전단류 (시작): {q_s_actual:.2f} N/mm\n"
+                        f" - 실제 전단류 (끝점): {q_e_actual:.2f} N/mm\n"
+                        f"   (※ 총 전단력 {getattr(self, 'user_Vy_total', 0):,.0f} N 반영 기준)"
+                    )
+
                 from PySide6.QtWidgets import QMessageBox
                 QMessageBox.information(self, f"Edge ID: {edge_id}", info_text)
 
@@ -1762,14 +1802,19 @@ class UltimateShipAnalyzer(QMainWindow):
                 dialog.exec()
 
     def refresh_ui(self):
+        if hasattr(self, 'cbar') and self.cbar is not None:
+            try:
+                self.cbar.remove()
+            except:
+                pass
+            self.cbar = None
+
         self.fig1.clear()
         self.fig2.clear()
         ax1, ax2 = self.fig1.add_subplot(111), self.fig2.add_subplot(111)
 
         if self.is_calculated:
-            # ----------------------------------------------------
-            # [도면 1 (ax1): 최종 1D 형상 뷰] (기존 동일)
-            # ----------------------------------------------------
+            # [도면 1: 최종 1D 형상 뷰]
             if hasattr(self, 'final_healed_centerlines'):
                 for cl in self.final_healed_centerlines:
                     lo = cl['line']
@@ -1786,17 +1831,61 @@ class UltimateShipAnalyzer(QMainWindow):
                             elif poly.geom_type == 'MultiPolygon':
                                 for p in poly.geoms:
                                     ax1.fill(*p.exterior.xy, color=final_color, alpha=0.3, zorder=9, edgecolor='none')
-                        except: pass
+                        except:
+                            pass
                     ax1.plot(*lo.xy, color=final_color, linewidth=2.0, alpha=0.9, zorder=10)
 
-            # ----------------------------------------------------
-            # ✨ [도면 2 (ax2): 클릭 가능한 그래프 뷰 (슬릿 로직 완전 삭제)]
-            # ----------------------------------------------------
+            # ✨ [도면 2: 1/mm 단위 전단류 히트맵]
             if hasattr(self, 'graph_edges'):
-                for edge in self.graph_edges:
-                    geom = edge['geometry']
-                    ax2.plot(*geom.xy, color='dodgerblue', linewidth=2.5, alpha=0.8,
-                             zorder=10, picker=5, gid=f"edge_{edge['id']}")
+                if hasattr(self, 'edge_q_results') and self.edge_q_results:
+                    import matplotlib.colors as mcolors
+                    import matplotlib.cm as cm
+
+                    max_q_unit = 1e-9
+                    for sub_list in self.edge_q_results.values():
+                        for chunk in sub_list:
+                            max_q_unit = max(max_q_unit, abs(chunk['q_start_unit']), abs(chunk['q_end_unit']))
+
+                    cmap = cm.turbo
+                    norm = mcolors.Normalize(vmin=0, vmax=max_q_unit)
+
+                    # 300mm 단위로 쪼개진 곡선 조각들을 그라데이션으로 렌더링
+                    for eid, edge_data in enumerate(self.graph_edges):
+                        res_list = self.edge_q_results.get(eid)
+                        if res_list:
+                            for chunk in res_list:
+                                sub_geom = chunk['geom']
+                                q_mid = abs((chunk['q_start_unit'] + chunk['q_end_unit']) / 2.0)
+                                c = np.array(sub_geom.coords)
+                                ax2.plot(c[:, 0], c[:, 1], color=cmap(norm(q_mid)),
+                                         linewidth=3.5, zorder=10, picker=5, gid=f"edge_{eid}")
+                        else:
+                            geom = edge_data['geometry']
+                            ax2.plot(*geom.xy, color='dodgerblue', linewidth=2.5, alpha=0.8,
+                                     zorder=10, picker=5, gid=f"edge_{eid}")
+
+                    # 슬릿 부재 가시화
+                    cut_edge_ids = [c['edge_id'] for c in self.cut_edges_info] if hasattr(self,
+                                                                                          'cut_edges_info') else []
+                    for eid in cut_edge_ids:
+                        if eid < len(self.graph_edges):
+                            geom = self.graph_edges[eid]['geometry']
+                            ax2.plot(*geom.xy, color='#BDC3C7', linewidth=2.5, linestyle='--', zorder=5)
+
+                    # 컬러바 축 생성 (단위 명시)
+                    sm = plt.cm.ScalarMappable(cmap=cmap, norm=norm)
+                    sm.set_array([])
+                    self.cbar = self.fig2.colorbar(sm, ax=ax2, fraction=0.046, pad=0.04)
+
+                    user_vy = getattr(self, 'user_Vy_total', 0)
+                    label_text = f'Unit Shear Flow |q_d| (1/mm)\n[Total Vy = {user_vy:,.0f} N 적용]'
+                    self.cbar.set_label(label_text, fontweight='bold', fontsize=10)
+
+                else:
+                    for edge in self.graph_edges:
+                        geom = edge['geometry']
+                        ax2.plot(*geom.xy, color='dodgerblue', linewidth=2.5, alpha=0.8, zorder=10, picker=5,
+                                 gid=f"edge_{edge['id']}")
 
                 node_xs = [pt[0] for pt in self.graph_nodes.values()]
                 node_ys = [pt[1] for pt in self.graph_nodes.values()]
@@ -1806,18 +1895,13 @@ class UltimateShipAnalyzer(QMainWindow):
                     ax2.annotate(str(nid), (pt[0], pt[1]), xytext=(4, 4), textcoords='offset points',
                                  color='black', fontsize=9, fontweight='bold', zorder=25)
 
-                # ✨ 새로 추가된 부분: 알고리즘에 의해 도출된 슬릿 노드 특별 시각화
                 if hasattr(self, 'flowchart_slit_nodes') and self.flowchart_slit_nodes:
                     for i, nid in enumerate(self.flowchart_slit_nodes):
-                        pt = self.graph_nodes[nid]
-                        # 범례(Legend)는 첫 번째 마커에만 표시되도록 라벨 부여
-                        label = 'Slit Position (Cut Node)' if i == 0 else ""
-
-                        # 개별적으로 scatter를 그려서 클릭(picker) 가능하게 만듦
-                        ax2.scatter(pt[0], pt[1], color='lime', marker='*', s=250,
-                                    zorder=30, edgecolors='black', picker=5,
-                                    gid=f"slit_{nid}", label=label)
-
+                        if nid in self.graph_nodes:
+                            pt = self.graph_nodes[nid]
+                            label = 'Slit Position (Cut Node)' if i == 0 else ""
+                            ax2.scatter(pt[0], pt[1], color='lime', marker='*', s=250, zorder=30, edgecolors='black',
+                                        picker=5, gid=f"slit_{nid}", label=label)
                     ax2.legend(loc='upper right')
 
         else:
@@ -1828,7 +1912,7 @@ class UltimateShipAnalyzer(QMainWindow):
 
         for ax in [ax1, ax2]:
             ax.set_aspect('equal')
-            ax.grid(True, lw=0.3)
+            ax.grid(True, lw=0.3, linestyle=':')
             ax.xaxis.set_major_formatter(FuncFormatter(lambda x, pos: f"{-x:g}"))
 
         self.can1.draw()
@@ -1902,6 +1986,215 @@ class UltimateShipAnalyzer(QMainWindow):
                     pass
 
         return final_nodes
+
+    def calculate_determinate_shear_flow(self, Vy_total=1000000.0):
+        """대칭 단면 1/mm 단위 정정전단류 계산 (빌지 곡선 보존 및 300mm 분할 반복)"""
+        nodes = self.graph_nodes
+        edges = self.remaining_edges_info
+        from shapely.ops import substring
+
+        # 1. 단면적 및 중립축(NA_y) 정밀 계산 (곡선 기하학 직접 반영)
+        total_area = 0.0
+        sum_qx = 0.0
+        for eid, e in edges.items():
+            geom = self.graph_edges[eid]['geometry']
+            thk = self.graph_edges[eid]['thickness']
+            L = geom.length
+            if L < 1e-6: continue
+            a = L * thk
+            yc = geom.centroid.y
+            total_area += a
+            sum_qx += a * yc
+
+        if total_area < 1e-6: return
+        na_y = sum_qx / total_area
+
+        # 2. I_xx 정밀 계산 (곡선을 50mm 단위로 미세 분할하여 평행축 정리 누적)
+        ixx = 0.0
+        for eid, e in edges.items():
+            geom = self.graph_edges[eid]['geometry']
+            thk = self.graph_edges[eid]['thickness']
+            num_chunks = max(1, int(geom.length / 50.0))
+            chunk_len = geom.length / num_chunks
+            for i in range(num_chunks):
+                sub = substring(geom, i * chunk_len, (i + 1) * chunk_len)
+                a = sub.length * thk
+                yc = sub.centroid.y
+                c = list(sub.coords)
+                dy = c[-1][1] - c[0][1]
+                i_local = a * (dy ** 2) / 12.0
+                ixx += i_local + a * (yc - na_y) ** 2
+
+        if ixx == 0: return
+
+        # 3. 순서도 초기화 단계
+        from collections import defaultdict
+        nm = defaultdict(int)
+        for e in edges.values():
+            nm[e['u']] += 1
+            nm[e['v']] += 1
+
+        vn = defaultdict(int)
+        vm = {eid: 0 for eid in edges}
+
+        node_flows_unit = defaultdict(dict)
+        self.edge_q_results = {}
+
+        # 4. 순서도 기반 경로 탐색 및 300mm 분할 누적 계산
+        while True:
+            # [Phase 1] 자유 노드
+            path_started = False
+            for n, deg in nm.items():
+                if deg == 1 and vn[n] == 0:
+                    i_curr = n
+                    vn[i_curr] += 1
+                    q_curr_unit = 0.0
+                    path_started = True
+
+                    while True:
+                        m = None
+                        for eid, e in edges.items():
+                            if vm[eid] == 0 and (e['u'] == i_curr or e['v'] == i_curr):
+                                m = eid
+                                break
+                        if m is None: break
+
+                        j_next = edges[m]['v'] if edges[m]['u'] == i_curr else edges[m]['u']
+
+                        # ✨ 곡선 기하학 및 진행 방향 판별
+                        geom = self.graph_edges[m]['geometry']
+                        thk = self.graph_edges[m]['thickness']
+                        coord_u = nodes[i_curr]
+                        geom_start = geom.coords[0]
+                        geom_end = geom.coords[-1]
+
+                        dist_to_start = np.hypot(coord_u[0] - geom_start[0], coord_u[1] - geom_start[1])
+                        dist_to_end = np.hypot(coord_u[0] - geom_end[0], coord_u[1] - geom_end[1])
+                        is_forward = dist_to_start < dist_to_end
+
+                        # ✨ 300mm 단위로 곡선 경로 분할 계산
+                        L_total = geom.length
+                        num_chunks = max(1, int(np.ceil(L_total / 300.0)))
+
+                        sub_results = []
+                        for k in range(num_chunks):
+                            if is_forward:
+                                d1 = k * (L_total / num_chunks)
+                                d2 = (k + 1) * (L_total / num_chunks)
+                            else:
+                                d1 = L_total - (k + 1) * (L_total / num_chunks)
+                                d2 = L_total - k * (L_total / num_chunks)
+
+                            sub_geom = substring(geom, min(d1, d2), max(d1, d2))
+                            if sub_geom.length < 1e-6: continue
+
+                            # 해당 분할 구간의 단면적 및 도심 계산
+                            A_sub = sub_geom.length * thk
+                            y_bar = sub_geom.centroid.y - na_y
+                            dS_z = A_sub * y_bar
+
+                            # 단위 힘에 대한 전단류 (1/mm) = (V_half / V_total) / I_xx * dS_z = 0.5 / I_xx * dS_z
+                            dq_unit = - (0.5 / ixx) * dS_z
+                            q_next_unit = q_curr_unit + dq_unit
+
+                            sub_results.append({
+                                'geom': sub_geom,
+                                'q_start_unit': q_curr_unit,
+                                'q_end_unit': q_next_unit
+                            })
+                            q_curr_unit = q_next_unit
+
+                        self.edge_q_results[m] = sub_results
+                        node_flows_unit[j_next][m] = q_curr_unit
+
+                        vm[m] += 1
+                        vn[j_next] += 1
+                        i_curr = j_next
+
+                        if nm[j_next] == 1 or nm[j_next] >= 3:
+                            break
+
+            # [Phase 2] 교차점 슈퍼포지션 (Phase 1과 동일한 300mm 곡선 분할 로직 적용)
+            if not path_started:
+                bridge_started = False
+                for n, deg in nm.items():
+                    if vn[n] == deg - 1 and deg >= 3:
+                        m_unvisited = None
+                        for eid, e in edges.items():
+                            if vm[eid] == 0 and (e['u'] == n or e['v'] == n):
+                                m_unvisited = eid
+                                break
+
+                        if m_unvisited is not None:
+                            i_curr = n
+                            vn[i_curr] += 1
+                            q_curr_unit = sum(node_flows_unit[i_curr].values())
+                            bridge_started = True
+
+                            while True:
+                                m = None
+                                for eid, e in edges.items():
+                                    if vm[eid] == 0 and (e['u'] == i_curr or e['v'] == i_curr):
+                                        m = eid
+                                        break
+                                if m is None: break
+
+                                j_next = edges[m]['v'] if edges[m]['u'] == i_curr else edges[m]['u']
+
+                                geom = self.graph_edges[m]['geometry']
+                                thk = self.graph_edges[m]['thickness']
+                                coord_u = nodes[i_curr]
+                                geom_start = geom.coords[0]
+                                geom_end = geom.coords[-1]
+
+                                dist_to_start = np.hypot(coord_u[0] - geom_start[0], coord_u[1] - geom_start[1])
+                                dist_to_end = np.hypot(coord_u[0] - geom_end[0], coord_u[1] - geom_end[1])
+                                is_forward = dist_to_start < dist_to_end
+
+                                L_total = geom.length
+                                num_chunks = max(1, int(np.ceil(L_total / 300.0)))
+
+                                sub_results = []
+                                for k in range(num_chunks):
+                                    if is_forward:
+                                        d1 = k * (L_total / num_chunks)
+                                        d2 = (k + 1) * (L_total / num_chunks)
+                                    else:
+                                        d1 = L_total - (k + 1) * (L_total / num_chunks)
+                                        d2 = L_total - k * (L_total / num_chunks)
+
+                                    sub_geom = substring(geom, min(d1, d2), max(d1, d2))
+                                    if sub_geom.length < 1e-6: continue
+
+                                    A_sub = sub_geom.length * thk
+                                    y_bar = sub_geom.centroid.y - na_y
+                                    dS_z = A_sub * y_bar
+
+                                    dq_unit = - (0.5 / ixx) * dS_z
+                                    q_next_unit = q_curr_unit + dq_unit
+
+                                    sub_results.append({
+                                        'geom': sub_geom,
+                                        'q_start_unit': q_curr_unit,
+                                        'q_end_unit': q_next_unit
+                                    })
+                                    q_curr_unit = q_next_unit
+
+                                self.edge_q_results[m] = sub_results
+                                node_flows_unit[j_next][m] = q_curr_unit
+
+                                vm[m] += 1
+                                vn[j_next] += 1
+                                i_curr = j_next
+
+                                if nm[j_next] == 1 or nm[j_next] >= 3:
+                                    break
+
+                if not bridge_started:
+                    break
+
+        # UI 및 클릭 이벤트를 위해 총 전단력 저장
+        self.user_Vy_total = Vy_total
 
 
 if __name__ == "__main__":
