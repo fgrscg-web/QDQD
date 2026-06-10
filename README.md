@@ -22,7 +22,7 @@ from matplotlib.ticker import FuncFormatter
 from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                                QPushButton, QLabel, QTextEdit, QFileDialog, QLineEdit,
                                QHBoxLayout, QScrollArea, QFrame, QSplitter, QComboBox,
-                               QInputDialog, QMessageBox, QProgressDialog, QRadioButton,QDialog)
+                               QInputDialog, QMessageBox, QProgressDialog, QRadioButton, QDialog)
 from PySide6.QtGui import QTextCursor, QIcon
 from PySide6.QtCore import Qt
 
@@ -1399,9 +1399,7 @@ class UltimateShipAnalyzer(QMainWindow):
             progress.setLabelText("Calculating Determinate Shear Flow...")
             try:
                 # 1. UI 창에서 입력받은 텍스트를 직접 호출합니다.
-                # ⚠️ 주의: 'self.ui_vy_input'은 사용자님의 실제 QLineEdit 변수명으로 반드시 바꿔주세요!
-                # (예: self.lineEdit_Vy.text(), self.vy_input.text() 등)
-                raw_vy_text = self.Vy_input_N.text().strip()
+                raw_vy_text = self.txt_vy.text().strip()
 
                 # 2. 빈칸인지 확인
                 if not raw_vy_text:
@@ -1429,7 +1427,6 @@ class UltimateShipAnalyzer(QMainWindow):
 
             progress.setLabelText("Calculating Indeterminate Shear Flow...")
             self.calculate_indeterminate_shear_flow()
-
 
             progress.setLabelText("Calculating Section Properties...")
             progress.setValue(99)
@@ -1530,6 +1527,7 @@ class UltimateShipAnalyzer(QMainWindow):
         # =====================================================================
         # ✨ 신규 추가: 위상 노드 추출 (반단면 컷팅 & 선분 클릭 이벤트 포함)
         # =====================================================================
+
     def build_graph(self):
         from collections import defaultdict
         from shapely.geometry import box, LineString
@@ -1688,7 +1686,7 @@ class UltimateShipAnalyzer(QMainWindow):
             f"- 유효 노드 (Nodes)  : {len(self.graph_nodes)} 개\n"
             f"- 생성된 선분 (Edges)  : {len(self.graph_edges)} 개\n"
             f"----------------------------------------\n"
-            )
+        )
 
     def detect_closed_cells(self):
         """Shapely를 활용하여 단면 내의 폐쇄된 방(Cell)과 공유 격벽을 엄격하게 탐색합니다."""
@@ -1713,11 +1711,10 @@ class UltimateShipAnalyzer(QMainWindow):
             bound = poly.boundary
             for eid, e in enumerate(self.graph_edges):
                 geom = e['geometry']
-                # 선분의 중간점(centroid)을 기준으로 검사하여 인식률 극대화 (허용 오차 1e-2)
-                if bound.distance(geom.centroid) < 1e-2 or bound.distance(geom) < 1e-2:
+                # 반드시 부재의 '중심점(centroid)'이 경계선 위에 있는지만 엄격하게 검사합니다.
+                if bound.distance(geom.centroid) < 1e-2:
                     cell_edges.append(eid)
                     self.edge_to_cells[eid].append(cell_id)
-
             self.cells_info.append({
                 'cell_id': cell_id,
                 'polygon': poly,
@@ -2440,9 +2437,14 @@ class UltimateShipAnalyzer(QMainWindow):
 
             for eid in cinfo['edges']:
                 geom = self.graph_edges[eid]['geometry']
-                # Shapely 기하학 투영을 활용한 완벽한 방향성 검증
-                d_s = ext.project(Point(geom.coords[0]))
-                d_e = ext.project(Point(geom.coords[-1]))
+
+                # ✨ [버그 수정] 둘레의 절반보다 긴 부재의 방향성 역전 오판을 막기 위해,
+                # 양 끝점이 아닌 선분 중간의 40% ~ 60% 지점만 떼어내서 미세 벡터의 방향을 투영합니다.
+                pt1 = geom.interpolate(0.4, normalized=True)
+                pt2 = geom.interpolate(0.6, normalized=True)
+
+                d_s = ext.project(pt1)
+                d_e = ext.project(pt2)
 
                 # 외곽선을 따라 이동하는 방향 판별 (둘레 한 바퀴 Wrap-around 고려)
                 diff = (d_e - d_s) % ext_len
