@@ -22,7 +22,7 @@ from matplotlib.ticker import FuncFormatter
 from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                                QPushButton, QLabel, QTextEdit, QFileDialog, QLineEdit,
                                QHBoxLayout, QScrollArea, QFrame, QSplitter, QComboBox,
-                               QInputDialog, QMessageBox, QProgressDialog, QRadioButton, QDialog)
+                               QInputDialog, QMessageBox, QProgressDialog, QRadioButton,QDialog)
 from PySide6.QtGui import QTextCursor, QIcon
 from PySide6.QtCore import Qt
 
@@ -1386,7 +1386,6 @@ class UltimateShipAnalyzer(QMainWindow):
                 # 1 ton(t) = 9806.65 N 으로 변환 (응력 및 전단류 단위 N/mm 연동을 위함)
                 Vy_input_N = Vy_input_t * 9806.65
 
-
             except ValueError:
                 # 임의의 값 대신 경고 팝업창을 띄우고 변환 프로세스 즉시 중단
                 progress.close()
@@ -1397,36 +1396,8 @@ class UltimateShipAnalyzer(QMainWindow):
                 return
 
             progress.setLabelText("Calculating Determinate Shear Flow...")
-            try:
-                # 1. UI 창에서 입력받은 텍스트를 직접 호출합니다.
-                raw_vy_text = self.txt_vy.text().strip()
-
-                # 2. 빈칸인지 확인
-                if not raw_vy_text:
-                    raise ValueError("전단력 입력칸이 비어 있습니다.")
-
-                # 3. 실수형 숫자로 변환하여 self 변수에 '저장'
-                self.user_Vy_total = float(raw_vy_text)
-
-                # 4. 0이나 음수인지 확인 (선택 사항이나 역학적으로 중요)
-                if self.user_Vy_total <= 0:
-                    raise ValueError("전단력은 0보다 커야 합니다.")
-
-            except Exception as e:
-                # [실패 시] 임의의 값을 넣지 않고 경고창을 띄운 후 "즉시 계산 중단(return)"
-                from PySide6.QtWidgets import QMessageBox
-                QMessageBox.warning(self, "입력 오류", f"올바른 총 전단력(Vy) 값을 입력해 주세요.\n(원인: {e})")
-
-                if hasattr(self, 'progress') and self.progress:
-                    self.progress.close()
-                return  # 여기서 함수를 끝내버립니다. (아래 계산 코드로 안 넘어감)
-                # ==========================================================
-
-                # 🟢 위의 관문을 완벽히 통과(저장 성공)했을 때만 전단류 계산 실행
-            self.calculate_determinate_shear_flow(self.user_Vy_total)
-
-            progress.setLabelText("Calculating Indeterminate Shear Flow...")
-            self.calculate_indeterminate_shear_flow()
+            self.calculate_determinate_shear_flow(Vy_total=Vy_input_N)
+            QApplication.processEvents()
 
             progress.setLabelText("Calculating Section Properties...")
             progress.setValue(99)
@@ -1503,11 +1474,10 @@ class UltimateShipAnalyzer(QMainWindow):
                 f"- Aligned Internal Lines (1102, 157): {len(self.aligned_internal)}\n"
                 f"- Added Stiffeners (6001~9001): {len(stiff_cl)}\n"
                 f"- Final Healed Elements: {len(all_cl)}"
-                f"{calc_result_text}"
+                f"{calc_result_text}"  # ⚠️ 이 블록 내부의 모든 이너시아(6001~9001 포함) 출력은 '반단면 값 * 2' 형태로 적용되어 있어야 합니다.
                 f"{self.graph_summary}"
                 f"{getattr(self, 'cell_summary', '')}"
-                f"{shear_ixx_text}"
-                f"{getattr(self, 'q0_summary', '')}"
+                f"{shear_ixx_text}"  # 새로 반영된 전단류용 이너시아 요약 정보
             )
             self.result_box.setText(summary_text)
 
@@ -1527,7 +1497,6 @@ class UltimateShipAnalyzer(QMainWindow):
         # =====================================================================
         # ✨ 신규 추가: 위상 노드 추출 (반단면 컷팅 & 선분 클릭 이벤트 포함)
         # =====================================================================
-
     def build_graph(self):
         from collections import defaultdict
         from shapely.geometry import box, LineString
@@ -1686,7 +1655,7 @@ class UltimateShipAnalyzer(QMainWindow):
             f"- 유효 노드 (Nodes)  : {len(self.graph_nodes)} 개\n"
             f"- 생성된 선분 (Edges)  : {len(self.graph_edges)} 개\n"
             f"----------------------------------------\n"
-        )
+            )
 
     def detect_closed_cells(self):
         """Shapely를 활용하여 단면 내의 폐쇄된 방(Cell)과 공유 격벽을 엄격하게 탐색합니다."""
@@ -1711,10 +1680,13 @@ class UltimateShipAnalyzer(QMainWindow):
             bound = poly.boundary
             for eid, e in enumerate(self.graph_edges):
                 geom = e['geometry']
+
+                # ✨ [버그 수정] 단순히 닿아있는 부재가 들어오는 것을 막기 위해,
                 # 반드시 부재의 '중심점(centroid)'이 경계선 위에 있는지만 엄격하게 검사합니다.
                 if bound.distance(geom.centroid) < 1e-2:
                     cell_edges.append(eid)
                     self.edge_to_cells[eid].append(cell_id)
+
             self.cells_info.append({
                 'cell_id': cell_id,
                 'polygon': poly,
@@ -2051,7 +2023,8 @@ class UltimateShipAnalyzer(QMainWindow):
                     sm = plt.cm.ScalarMappable(cmap=cmap, norm=norm)
                     sm.set_array([])
                     self.cbar = self.fig2.colorbar(sm, ax=ax2, fraction=0.046, pad=0.04)
-                    self.cbar.set_label(f'Final Shear Stress τ (MPa)]', fontweight='bold', fontsize=10)
+                    self.cbar.set_label(f'Signed Shear Stress τ_d (MPa)\n[Total Vy = {user_vy:,.0f} N 적용]',
+                                        fontweight='bold', fontsize=10)
 
                 node_xs = [pt[0] for pt in self.graph_nodes.values()]
                 node_ys = [pt[1] for pt in self.graph_nodes.values()]
@@ -2344,7 +2317,7 @@ class UltimateShipAnalyzer(QMainWindow):
                                 })
 
                                 L_total = geom.length
-                                num_chunks = max(1, int(np.ceil(L_total / 300.0)))
+                                num_chunks = max(1, int(np.ceil(L_total / 200.0)))
                                 sub_results = []
                                 # (이하 chunk 계산 루프 기존과 동일...)
                                 for k in range(num_chunks):
@@ -2386,131 +2359,6 @@ class UltimateShipAnalyzer(QMainWindow):
 
         self.user_Vy_total = Vy_total
 
-    def calculate_indeterminate_shear_flow(self):
-        """
-        [부정정 전단류 계산 4단계]
-        1. 폐루프(Cell)별 ∮ q_d / t ds 선적분 계산
-        2. 선적분 경로와 셀 내부 CCW 순환 방향 통합 (dir_sign 판별)
-        3. N원 1차 연립방정식 (A_mat * q0 = B_vec) 조립 및 풀이
-        4. 도출된 q0를 각 폐루프 내 모든 부재에 중첩 (q_final = q_d + q_0)
-        """
-        import numpy as np
-        from shapely.geometry import Point
-
-        if not hasattr(self, 'cells_info') or not self.cells_info:
-            self.q0_summary = "\n- ⚠️ 닫힌 방(Cell)이 없어 부정정 전단류 계산이 생략되었습니다."
-            return
-
-        num_cells = len(self.cells_info)
-        A_mat = np.zeros((num_cells, num_cells))
-        B_vec = np.zeros(num_cells)
-
-        # =================================================================
-        # 1. Edge별 정정 전단류 선적분 (Start->End 고유 방향 기준)
-        # =================================================================
-        edge_integral = {}
-        for eid, chunks in self.edge_q_results.items():
-            thk = self.graph_edges[eid].get('thickness', 10.0)
-            if thk < 0.1: thk = 0.1
-
-            int_val = 0.0
-            for chunk in chunks:
-                ds = chunk['geom'].length
-                # 해당 조각의 평균 전단류 (q_start + q_end) / 2
-                q_avg = (chunk['q_start_unit'] + chunk['q_end_unit']) / 2.0
-
-                if chunk['is_forward']:
-                    int_val += (q_avg / thk) * ds
-                else:
-                    int_val -= (q_avg / thk) * ds
-            edge_integral[eid] = int_val
-
-        # =================================================================
-        # 2. Cell별 CCW 순환 방향과 Edge 고유 방향 일치 여부 판별
-        # =================================================================
-        edge_dirs = {i: {} for i in range(num_cells)}
-
-        for i, cinfo in enumerate(self.cells_info):
-            ext = cinfo['polygon'].exterior
-            is_ext_ccw = ext.is_ccw
-            ext_len = ext.length
-
-            for eid in cinfo['edges']:
-                geom = self.graph_edges[eid]['geometry']
-
-                # ✨ [버그 수정] 둘레의 절반보다 긴 부재의 방향성 역전 오판을 막기 위해,
-                # 양 끝점이 아닌 선분 중간의 40% ~ 60% 지점만 떼어내서 미세 벡터의 방향을 투영합니다.
-                pt1 = geom.interpolate(0.4, normalized=True)
-                pt2 = geom.interpolate(0.6, normalized=True)
-
-                d_s = ext.project(pt1)
-                d_e = ext.project(pt2)
-
-                # 외곽선을 따라 이동하는 방향 판별 (둘레 한 바퀴 Wrap-around 고려)
-                diff = (d_e - d_s) % ext_len
-                matches_ext = 1.0 if diff < ext_len / 2 else -1.0
-
-                # 최종적으로 CCW(반시계방향)을 정방향(+1)으로 정의
-                dir_sign = matches_ext if is_ext_ccw else -matches_ext
-                edge_dirs[i][eid] = dir_sign
-
-        # =================================================================
-        # 3. 행렬 조립 (Matrix Assembly) 및 풀이
-        # =================================================================
-        for i, cinfo in enumerate(self.cells_info):
-            integral_qd_t = 0.0
-            for eid in cinfo['edges']:
-                thk = self.graph_edges[eid].get('thickness', 10.0)
-                if thk < 0.1: thk = 0.1
-                ds_t = self.graph_edges[eid]['geometry'].length / thk
-
-                dir_i = edge_dirs[i][eid]
-                integral_qd_t += dir_i * edge_integral.get(eid, 0.0)
-
-                # 대각 성분 (자기 자신 방의 부재들)
-                A_mat[i, i] += ds_t
-
-                # 공유 격벽 처리 (인접 Cell 빼기)
-                for cid in self.edge_to_cells.get(eid, []):
-                    j = cid - 1
-                    if i != j:
-                        A_mat[i, j] -= ds_t
-
-            # B 벡터 = - ∮ q_d / t ds
-            B_vec[i] = -integral_qd_t
-
-        try:
-            # 연립방정식 풀이 (q0 도출)
-            q0_vals = np.linalg.solve(A_mat, B_vec)
-        except np.linalg.LinAlgError:
-            self.q0_summary = "\n- ⚠️ 행렬이 특이(Singular)하여 부정정 전단류 계산에 실패했습니다."
-            return
-
-        # =================================================================
-        # 4. 최종 전단류 중첩 (Superposition: q_final = q_d + q_0)
-        # =================================================================
-        for eid, chunks in self.edge_q_results.items():
-            belonging_cells = self.edge_to_cells.get(eid, [])
-            if not belonging_cells: continue
-
-            # 부재에 작용하는 알짜 q0 (Start->End 방향 기준)
-            q0_net = sum([edge_dirs[cid - 1][eid] * q0_vals[cid - 1] for cid in belonging_cells])
-
-            # 각 조각(Chunk)의 기존 q_d 값에 q0_net을 물리적 방향에 맞춰 실시간 중첩
-            for chunk in chunks:
-                if chunk['is_forward']:
-                    chunk['q_start_unit'] += q0_net
-                    chunk['q_end_unit'] += q0_net
-                else:
-                    chunk['q_start_unit'] -= q0_net
-                    chunk['q_end_unit'] -= q0_net
-
-        # 좌측 디버그/출력용 텍스트 저장
-        self.q0_summary = "\n\n🟩 [Indeterminate Shear Flow (q0) Results]\n"
-        for i, cinfo in enumerate(self.cells_info):
-            # 사용자가 설정한 Total Vy 기준으로 스케일업된 실제 q0 출력
-            q0_actual = q0_vals[i] * getattr(self, 'user_Vy_total', 1000000.0)
-            self.q0_summary += f"  > Cell {cinfo['cell_id']}: q0 = {q0_actual:,.2f} N/mm\n"
 
 
 if __name__ == "__main__":
