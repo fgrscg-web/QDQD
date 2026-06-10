@@ -1355,70 +1355,21 @@ class UltimateShipAnalyzer(QMainWindow):
 
             progress.setLabelText("Processing Stiffeners (6001~9001)...")
             raw_stiffs = c6001 + c7001 + c8001 + c9001
+            stiff_s_raw = []
+            for l in filter_short(raw_stiffs, 10.0):
+                stiff_s_raw.extend(split_by_slope(l, at=5.0))
 
-            # 1. 공간적 근접성에 따른 스티프너 그룹화 (직교/교차/분리된 선분들을 하나의 보강재로 묶음)
-            stiff_groups = []
-            for ls in raw_stiffs:
-                if ls.length < 10.0: continue
-                placed = False
-                for grp in stiff_groups:
-                    for grp_ls in grp:
-                        # 두 선분 사이 최단 거리가 200mm 이내면 동일 스티프너 객체로 취급
-                        if ls.distance(grp_ls) < 200.0:
-                            grp.append(ls)
-                            placed = True
-                            break
-                    if placed: break
-                if not placed:
-                    stiff_groups.append([ls])
+            stiff_s = remove_overlapping(filter_short(stiff_s_raw, 20.0), dt=1.0)
+            stiff_pairs = match_pairs(stiff_s, max_dist=50.0, angle_tol=20.0, overlap_tolerance=5.0)
 
-            self.processed_stiffeners = []
-            main_union = unary_union([cl['line'] for cl in self.hull_only_centerlines])
+            stiff_cl = create_continuous_stiffener_centerlines(stiff_pairs)
+            for c in stiff_cl:
+                c['type'] = 'stiffener'
+                c['color'] = '#FF7F0E'  # 보강재를 도면에서 식별하기 위한 주황색 지정
 
-            # 2. 스티프너별 개별 면적, 도심, 그리고 10mm 연장 시 닿는 외판/격벽 상의 '질점(부착점)' 계산
-            for grp in stiff_groups:
-                area = 0.0
-                sum_qx = 0.0
-                sum_qy = 0.0
-                for ls in grp:
-                    t = 10.0  # 보강재 두께 (필요시 도면 레이어 속성으로 연동 가능)
-                    a = ls.length * t
-                    area += a
-                    sum_qx += a * ls.centroid.x
-                    sum_qy += a * ls.centroid.y
-
-                if area < 1e-6: continue
-                cx = sum_qx / area
-                cy = sum_qy / area
-
-                endpoints = []
-                for ls in grp:
-                    c = list(ls.coords)
-                    endpoints.extend([Point(c[0]), Point(c[-1])])
-
-                attach_pt = None
-                best_dist = float('inf')
-                best_ep = None
-                for ep in endpoints:
-                    dist = ep.distance(main_union)
-                    if dist < best_dist:
-                        best_dist = dist
-                        best_ep = ep
-
-                # 10mm 연장 허용치(여유 포함 15.0mm) 내에 주 구조물이 있으면 부착점(질점)으로 확정
-                if best_dist <= 15.0 and best_ep is not None:
-                    nearest = nearest_points(best_ep, main_union)[1]
-                    attach_pt = (nearest.x, nearest.y)
-
-                self.processed_stiffeners.append({
-                    'lines': grp,
-                    'area': area,
-                    'centroid': Point(cx, cy),
-                    'attach_pt': attach_pt
-                })
-
-            # 주 구조물(all_cl)에 보강재 병합 금지! (전단류 경로 탐색에서 완전 배제)
-            self.final_healed_centerlines = self.hull_only_centerlines
+            # 주 구조물(all_cl)에 보강재(stiff_cl) 합병
+            all_cl.extend(stiff_cl)
+            self.final_healed_centerlines = all_cl
 
             progress.setLabelText("Building Mathematical Graph...")
             self.build_graph()
@@ -1476,31 +1427,6 @@ class UltimateShipAnalyzer(QMainWindow):
                     sum_qx += a * yc
                     segments_1d.append((a, yc, dx, dy, L))
 
-                for stiff in self.processed_stiffeners:
-                    if stiff['attach_pt']:
-                        total_area += stiff['area']
-                        sum_qx += stiff['area'] * stiff['centroid'].y
-
-                    # 2. 중립축(N.A) 및 평행축 정리를 이용한 단면 2차 모멘트(Ixx) 계산
-                if total_area > 0:
-                    na_y = sum_qx / total_area
-                    ixx = 0.0
-                    ixxm = 0.0
-
-                    for a, yc, dx, dy, L in segments_1d:
-                        i_local = (a * (dy ** 2)) / 12.0
-                        ixx += i_local + a * ((yc - na_y) ** 2)
-
-                    # ✨ 스티프너 Ixx 결과창에 추가
-                    for stiff in self.processed_stiffeners:
-                        if stiff['attach_pt']:
-                            ixx += stiff['area'] * ((stiff['centroid'].y - na_y) ** 2)
-                            for ls in stiff['lines']:
-                                a = ls.length * 10.0
-                                dy = ls.coords[-1][1] - ls.coords[0][1]
-                                ixx += a * (dy ** 2) / 12.0
-                    ixxm = ixx / 1e12
-
             # 2. 중립축(N.A) 및 평행축 정리를 이용한 단면 2차 모멘트(Ixx) 계산
             if total_area > 0:
                 na_y = sum_qx / total_area
@@ -1542,20 +1468,16 @@ class UltimateShipAnalyzer(QMainWindow):
                     f"- Hull 전체단면 이너시아: {self.shear_calc_ixx_full:,.0f} mm⁴ (전단류 계산식 반영 상수)"
                 )
 
-            # ✨ [핵심 해결] 에러의 주범인 stiff_cl을 없애고, 새로 만든 스티프너 리스트(processed_stiffeners)의 개수를 셉니다!
-            num_stiffs = len(self.processed_stiffeners) if hasattr(self, 'processed_stiffeners') else 0
-
             summary_text = (
                 "✅ 1D Transformation & Full Healing Complete!\n\n"
                 f"- Extracted Outer Hull Lines (1999): {len(cl1999)}\n"
                 f"- Aligned Internal Lines (1102, 157): {len(self.aligned_internal)}\n"
-                f"- Added Stiffeners (6001~9001): {num_stiffs}\n"
+                f"- Added Stiffeners (6001~9001): {len(stiff_cl)}\n"
                 f"- Final Healed Elements: {len(all_cl)}"
-                f"{calc_result_text}"
+                f"{calc_result_text}"  # ⚠️ 이 블록 내부의 모든 이너시아(6001~9001 포함) 출력은 '반단면 값 * 2' 형태로 적용되어 있어야 합니다.
                 f"{self.graph_summary}"
                 f"{getattr(self, 'cell_summary', '')}"
-                f"{shear_ixx_text}"
-                f"{getattr(self, 'q0_summary', '')}"
+                f"{shear_ixx_text}"  # 새로 반영된 전단류용 이너시아 요약 정보
             )
             self.result_box.setText(summary_text)
 
@@ -1567,8 +1489,7 @@ class UltimateShipAnalyzer(QMainWindow):
             import traceback
             self.result_box.setText(f"❌ Error:\n{str(e)}\n\n{traceback.format_exc()}")
         finally:
-            if hasattr(self, 'progress') and progress:
-                progress.close()
+            progress.close()
             self.is_processing = False
             self.btn_calc.setEnabled(True)
             self.btn_load.setEnabled(True)
@@ -1951,21 +1872,6 @@ class UltimateShipAnalyzer(QMainWindow):
         if self.is_calculated:
             # [도면 1: 최종 1D 형상 뷰]
             if hasattr(self, 'final_healed_centerlines'):
-                if hasattr(self, 'processed_stiffeners'):
-                    for stiff in self.processed_stiffeners:
-                        for ls in stiff['lines']:
-                            # 도면 1 (기하학 뷰)
-                            ax1.plot(*ls.xy, color='gray', linewidth=2.0, alpha=0.7, zorder=8)
-                            # 도면 2 (전단응력 그래프 뷰)
-                            ax2.plot(*ls.xy, color='gray', linewidth=2.0, alpha=0.7, zorder=8)
-
-                        if stiff['attach_pt']:
-                            # 외판/격벽에 닿는 부착점(질점)을 검은색 동그라미로 렌더링
-                            ax1.scatter(stiff['attach_pt'][0], stiff['attach_pt'][1], color='black', marker='o', s=35,
-                                        zorder=12)
-                            ax2.scatter(stiff['attach_pt'][0], stiff['attach_pt'][1], color='black', marker='o', s=35,
-                                        zorder=12)
-
                 for cl in self.final_healed_centerlines:
                     lo = cl['line']
                     c_type = cl.get('type')
@@ -2221,28 +2127,23 @@ class UltimateShipAnalyzer(QMainWindow):
         return final_nodes
 
     def calculate_determinate_shear_flow(self, Vy_total=1000000.0):
-        from shapely.ops import substring
-        from collections import defaultdict
-        from shapely.geometry import Point
-        import numpy as np
-
+        """선체 단면 그래프(스티프너 제외 반단면)에 대해 이너시아를 새로 구하여 정정전단류 계산"""
         nodes = self.graph_nodes
 
-        # ✨ [핵심 수정 1] 기하학 정보와 위상 정보(루프 절단 반영)를 완벽하게 통합한 딕셔너리(edges) 재구축
+        # 스티프너를 제외한 순수 선체(외판 및 격벽) 부재만 필터링
         edges = {}
         for eid, e_info in self.remaining_edges_info.items():
-            # 스티프너는 전단류 '흐름 경로'에서 원천 배제
             if self.graph_edges[eid].get('type') != 'stiffener':
-                edges[eid] = self.graph_edges[eid].copy()
-                edges[eid]['u'] = e_info['u']  # 위상 알고리즘이 찾아낸 진짜 시작점
-                edges[eid]['v'] = e_info['v']  # 위상 알고리즘이 찾아낸 진짜 끝점
+                edges[eid] = e_info
 
-        # 1. 반단면 기준 총 단면적 및 중립축(NA_y) 계산 (스티프너 질점 포함)
+        from shapely.ops import substring
+
+        # 1. 스티프너를 제외한 반단면 기준 단면적 및 중립축(NA_y) 계산
         total_area = 0.0
         sum_qx = 0.0
         for eid, e in edges.items():
-            geom = e['geometry']
-            thk = e.get('thickness', 10.0)
+            geom = self.graph_edges[eid]['geometry']
+            thk = self.graph_edges[eid].get('thickness', 10.0)
             L = geom.length
             if L < 1e-6: continue
             a = L * thk
@@ -2250,21 +2151,14 @@ class UltimateShipAnalyzer(QMainWindow):
             total_area += a
             sum_qx += a * yc
 
-        # ✨ 스티프너 질점 면적 역학적 추가
-        if hasattr(self, 'processed_stiffeners'):
-            for stiff in self.processed_stiffeners:
-                if stiff['attach_pt']:
-                    total_area += stiff['area']
-                    sum_qx += stiff['area'] * stiff['centroid'].y
-
         if total_area < 1e-6: return
         na_y = sum_qx / total_area
 
-        # 2. 반단면 기준 이너시아(Ixx_half) 계산 (스티프너 관성모멘트 포함)
+        # 2. 스티프너를 제외한 반단면 기준 이너시아(Ixx_half) 계산
         ixx_half = 0.0
         for eid, e in edges.items():
-            geom = e['geometry']
-            thk = e.get('thickness', 10.0)
+            geom = self.graph_edges[eid]['geometry']
+            thk = self.graph_edges[eid].get('thickness', 10.0)
             num_chunks = max(1, int(geom.length / 50.0))
             chunk_len = geom.length / num_chunks
             for i in range(num_chunks):
@@ -2276,54 +2170,28 @@ class UltimateShipAnalyzer(QMainWindow):
                 i_local = a * (dy ** 2) / 12.0
                 ixx_half += i_local + a * (yc - na_y) ** 2
 
-        # ✨ 스티프너 관성모멘트 역학적 추가 (평행축 정리)
-        if hasattr(self, 'processed_stiffeners'):
-            for stiff in self.processed_stiffeners:
-                if stiff['attach_pt']:
-                    ixx_half += stiff['area'] * ((stiff['centroid'].y - na_y) ** 2)
-                    for ls in stiff['lines']:
-                        a = ls.length * 10.0
-                        dy = ls.coords[-1][1] - ls.coords[0][1]
-                        ixx_half += a * (dy ** 2) / 12.0
-
         if ixx_half == 0: return
 
+        # 전단류 계산에 쓰인 이너시아 값 및 단면 특성 저장 (반단면 및 전체 단면)
         self.shear_calc_ixx_half = ixx_half
         self.shear_calc_ixx_full = ixx_half * 2
         self.shear_calc_na_y = na_y
 
-        # ✨ 분할 구간에서 스티프너의 단면 1차 모멘트(Q)를 더하기 위한 정밀 위치 매핑
-        stiff_points = defaultdict(list)
-        if hasattr(self, 'processed_stiffeners'):
-            for stiff in self.processed_stiffeners:
-                if stiff['attach_pt']:
-                    pt = Point(stiff['attach_pt'])
-                    best_eid = None
-                    best_dist = float('inf')
-                    for eid, e in edges.items():
-                        geom = e['geometry']
-                        d = geom.distance(pt)
-                        if d < best_dist:
-                            best_dist = d
-                            best_eid = eid
-                    if best_eid is not None and best_dist < 5.0:
-                        geom = edges[best_eid]['geometry']
-                        proj_dist = geom.project(pt)
-                        # 질점의 단면 1차 모멘트 증가분 (Area * y_bar)
-                        dS_z_stiff = stiff['area'] * (stiff['centroid'].y - na_y)
-                        stiff_points[best_eid].append((proj_dist, dS_z_stiff))
-
         # 3. 순서도 초기화 단계
+        from collections import defaultdict
         nm = defaultdict(int)
         for e in edges.values():
             nm[e['u']] += 1
             nm[e['v']] += 1
 
         vn = defaultdict(int)
-        vm = {eid: 0 for eid in edges.keys()}
+        vm = {eid: 0 for eid in edges}
 
+        # (기존 코드 생략...)
         node_flows_unit = defaultdict(dict)
         self.edge_q_results = {}
+
+        # ✨ [신규 추가] 부정정 해석을 위해 전단류가 흘러간 정확한 위상 경로와 방향 기록
         self.calc_route = []
 
         # 4. 순서도 기반 경로 탐색 및 300mm 분할 누적 계산
@@ -2346,8 +2214,8 @@ class UltimateShipAnalyzer(QMainWindow):
 
                         j_next = edges[m]['v'] if edges[m]['u'] == i_curr else edges[m]['u']
 
-                        geom = edges[m]['geometry']
-                        thk = edges[m].get('thickness', 10.0)
+                        geom = self.graph_edges[m]['geometry']
+                        thk = self.graph_edges[m].get('thickness', 10.0)
                         coord_u = nodes[i_curr]
                         geom_start = geom.coords[0]
                         geom_end = geom.coords[-1]
@@ -2356,6 +2224,7 @@ class UltimateShipAnalyzer(QMainWindow):
                         dist_to_end = np.hypot(coord_u[0] - geom_end[0], coord_u[1] - geom_end[1])
                         is_forward = dist_to_start < dist_to_end
 
+                        # ✨ [신규 추가] 부재 계산 방향 저장 (Phase 1)
                         self.calc_route.append({
                             'phase': 1,
                             'edge_id': m,
@@ -2367,7 +2236,7 @@ class UltimateShipAnalyzer(QMainWindow):
                         L_total = geom.length
                         num_chunks = max(1, int(np.ceil(L_total / 300.0)))
                         sub_results = []
-
+                        # (중략... 아래 chunk 계산 루프는 기존과 완전 동일합니다)
                         for k in range(num_chunks):
                             if is_forward:
                                 d1 = k * (L_total / num_chunks)
@@ -2376,21 +2245,12 @@ class UltimateShipAnalyzer(QMainWindow):
                                 d1 = L_total - (k + 1) * (L_total / num_chunks)
                                 d2 = L_total - k * (L_total / num_chunks)
 
-                            min_d, max_d = min(d1, d2), max(d1, d2)
-                            dq_stiff = 0.0
-
-                            # ✨ 해당 300mm 조각 안에 스티프너 질점이 있다면 1차 모멘트 폭발적 증가 반영
-                            for proj_dist, dS_z_s in stiff_points[m]:
-                                if min_d <= proj_dist < max_d:
-                                    dq_stiff += - (0.5 / ixx_half) * dS_z_s
-
-                            sub_geom = substring(geom, min_d, max_d)
+                            sub_geom = substring(geom, min(d1, d2), max(d1, d2))
                             if sub_geom.length < 1e-6: continue
                             A_sub = sub_geom.length * thk
                             y_bar = sub_geom.centroid.y - na_y
                             dS_z = A_sub * y_bar
-
-                            dq_unit = - (0.5 / ixx_half) * dS_z + dq_stiff
+                            dq_unit = - (0.5 / ixx_half) * dS_z
                             q_next_unit = q_curr_unit + dq_unit
 
                             sub_results.append({
@@ -2437,8 +2297,8 @@ class UltimateShipAnalyzer(QMainWindow):
 
                                 j_next = edges[m]['v'] if edges[m]['u'] == i_curr else edges[m]['u']
 
-                                geom = edges[m]['geometry']
-                                thk = edges[m].get('thickness', 10.0)
+                                geom = self.graph_edges[m]['geometry']
+                                thk = self.graph_edges[m].get('thickness', 10.0)
                                 coord_u = nodes[i_curr]
                                 geom_start = geom.coords[0]
                                 geom_end = geom.coords[-1]
@@ -2447,6 +2307,7 @@ class UltimateShipAnalyzer(QMainWindow):
                                 dist_to_end = np.hypot(coord_u[0] - geom_end[0], coord_u[1] - geom_end[1])
                                 is_forward = dist_to_start < dist_to_end
 
+                                # ✨ [신규 추가] 부재 계산 방향 저장 (Phase 2)
                                 self.calc_route.append({
                                     'phase': 2,
                                     'edge_id': m,
@@ -2458,7 +2319,7 @@ class UltimateShipAnalyzer(QMainWindow):
                                 L_total = geom.length
                                 num_chunks = max(1, int(np.ceil(L_total / 300.0)))
                                 sub_results = []
-
+                                # (이하 chunk 계산 루프 기존과 동일...)
                                 for k in range(num_chunks):
                                     if is_forward:
                                         d1 = k * (L_total / num_chunks)
@@ -2467,21 +2328,12 @@ class UltimateShipAnalyzer(QMainWindow):
                                         d1 = L_total - (k + 1) * (L_total / num_chunks)
                                         d2 = L_total - k * (L_total / num_chunks)
 
-                                    min_d, max_d = min(d1, d2), max(d1, d2)
-                                    dq_stiff = 0.0
-
-                                    # ✨ 해당 300mm 조각 안에 스티프너 질점이 있다면 1차 모멘트 폭발적 증가 반영
-                                    for proj_dist, dS_z_s in stiff_points[m]:
-                                        if min_d <= proj_dist < max_d:
-                                            dq_stiff += - (0.5 / ixx_half) * dS_z_s
-
-                                    sub_geom = substring(geom, min_d, max_d)
+                                    sub_geom = substring(geom, min(d1, d2), max(d1, d2))
                                     if sub_geom.length < 1e-6: continue
                                     A_sub = sub_geom.length * thk
                                     y_bar = sub_geom.centroid.y - na_y
                                     dS_z = A_sub * y_bar
-
-                                    dq_unit = - (0.5 / ixx_half) * dS_z + dq_stiff
+                                    dq_unit = - (0.5 / ixx_half) * dS_z
                                     q_next_unit = q_curr_unit + dq_unit
 
                                     sub_results.append({
