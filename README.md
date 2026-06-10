@@ -1380,17 +1380,12 @@ class UltimateShipAnalyzer(QMainWindow):
             progress.setLabelText("Executing Flowchart Algorithm...")
             self.execute_flowchart_algorithm()
 
-            progress.setLabelText("Calculating Determinate Shear Flow...")
-            self.calculate_determinate_shear_flow(self.user_Vy_total)
-
-            progress.setLabelText("Calculating Indeterminate Shear Flow...")
-            self.calculate_indeterminate_shear_flow()
-
             # ✨ 팝업창 대신 General Settings의 텍스트 상자에서 전단력 가져오기
             try:
                 Vy_input_t = float(self.txt_vy.text().strip())
                 # 1 ton(t) = 9806.65 N 으로 변환 (응력 및 전단류 단위 N/mm 연동을 위함)
                 Vy_input_N = Vy_input_t * 9806.65
+
 
             except ValueError:
                 # 임의의 값 대신 경고 팝업창을 띄우고 변환 프로세스 즉시 중단
@@ -1400,6 +1395,40 @@ class UltimateShipAnalyzer(QMainWindow):
                 self.btn_load.setEnabled(True)
                 QMessageBox.warning(self, "입력 오류", "전단력(Total Vy)에는 유효한 숫자(t 단위)를 입력해야 합니다.\n계산을 중단합니다.")
                 return
+
+            progress.setLabelText("Calculating Determinate Shear Flow...")
+            try:
+                # 1. UI 창에서 입력받은 텍스트를 직접 호출합니다.
+                # ⚠️ 주의: 'self.ui_vy_input'은 사용자님의 실제 QLineEdit 변수명으로 반드시 바꿔주세요!
+                # (예: self.lineEdit_Vy.text(), self.vy_input.text() 등)
+                raw_vy_text = self.Vy_input_N.text().strip()
+
+                # 2. 빈칸인지 확인
+                if not raw_vy_text:
+                    raise ValueError("전단력 입력칸이 비어 있습니다.")
+
+                # 3. 실수형 숫자로 변환하여 self 변수에 '저장'
+                self.user_Vy_total = float(raw_vy_text)
+
+                # 4. 0이나 음수인지 확인 (선택 사항이나 역학적으로 중요)
+                if self.user_Vy_total <= 0:
+                    raise ValueError("전단력은 0보다 커야 합니다.")
+
+            except Exception as e:
+                # [실패 시] 임의의 값을 넣지 않고 경고창을 띄운 후 "즉시 계산 중단(return)"
+                from PySide6.QtWidgets import QMessageBox
+                QMessageBox.warning(self, "입력 오류", f"올바른 총 전단력(Vy) 값을 입력해 주세요.\n(원인: {e})")
+
+                if hasattr(self, 'progress') and self.progress:
+                    self.progress.close()
+                return  # 여기서 함수를 끝내버립니다. (아래 계산 코드로 안 넘어감)
+                # ==========================================================
+
+                # 🟢 위의 관문을 완벽히 통과(저장 성공)했을 때만 전단류 계산 실행
+            self.calculate_determinate_shear_flow(self.user_Vy_total)
+
+            progress.setLabelText("Calculating Indeterminate Shear Flow...")
+            self.calculate_indeterminate_shear_flow()
 
 
             progress.setLabelText("Calculating Section Properties...")
