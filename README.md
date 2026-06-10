@@ -1467,14 +1467,13 @@ class UltimateShipAnalyzer(QMainWindow):
                 calc_result_text = "\n\n❌ 유효한 단면적이 없어 이너시아를 계산할 수 없습니다."
 
             # 3. 결과창 출력 텍스트 업데이트
-            ixx_text = ""
-            if hasattr(self, 'pure_hull_ixx_half'):
-                ixx_total = self.pure_hull_ixx_half * 2
-                ixx_text = (
-                    f"\n\n🟦 [Section Properties (Stiffeners Excluded)]\n"
-                    f"- 중립축 (N.A) : {self.pure_hull_na_y:,.2f} mm\n"
-                    f"- 반단면 Ixx  : {self.pure_hull_ixx_half:,.0f} mm⁴\n"
-                    f"- 전체 Ixx    : {ixx_total:,.0f} mm⁴ (계산 반영값)"
+            shear_ixx_text = ""
+            if hasattr(self, 'shear_calc_ixx_half'):
+                shear_ixx_text = (
+                    f"\n\n🟦 [Shear Flow Calc Section Properties (Half-Section Base)]\n"
+                    f"- Hull 중립축 (N.A)  : {self.shear_calc_na_y:,.2f} mm\n"
+                    f"- Hull 반단면 이너시아: {self.shear_calc_ixx_half:,.0f} mm⁴\n"
+                    f"- Hull 전체단면 이너시아: {self.shear_calc_ixx_full:,.0f} mm⁴ (전단류 계산식 반영 상수)"
                 )
 
             summary_text = (
@@ -1483,10 +1482,10 @@ class UltimateShipAnalyzer(QMainWindow):
                 f"- Aligned Internal Lines (1102, 157): {len(self.aligned_internal)}\n"
                 f"- Added Stiffeners (6001~9001): {len(stiff_cl)}\n"
                 f"- Final Healed Elements: {len(all_cl)}"
-                f"{calc_result_text}"
+                f"{calc_result_text}"  # ⚠️ 이 블록 내부의 모든 이너시아(6001~9001 포함) 출력은 '반단면 값 * 2' 형태로 적용되어 있어야 합니다.
                 f"{self.graph_summary}"
                 f"{getattr(self, 'cell_summary', '')}"
-                f"{ixx_text}"  # ✨ 위에서 만든 텍스트 추가
+                f"{shear_ixx_text}"  # 새로 반영된 전단류용 이너시아 요약 정보
             )
             self.result_box.setText(summary_text)
 
@@ -1898,16 +1897,14 @@ class UltimateShipAnalyzer(QMainWindow):
                             pass
                     ax1.plot(*lo.xy, color=final_color, linewidth=2.0, alpha=0.9, zorder=10)
 
-            # ✨ [도면 2: 수직 막대그래프형 전단응력 다이어그램]
+            # [도면 2: 전단응력 다이어그램]
             if hasattr(self, 'graph_edges'):
                 if hasattr(self, 'cells_info') and self.cells_info:
                     for cinfo in self.cells_info:
                         poly = cinfo['polygon']
                         cid = cinfo['cell_id']
-
                         cx, cy = poly.centroid.x, poly.centroid.y
-                        ax2.annotate(f"Cell {cid}", (cx, cy),
-                                     color='black', weight='bold', fontsize=12,
+                        ax2.annotate(f"Cell {cid}", (cx, cy), color='black', weight='bold', fontsize=12,
                                      ha='center', va='center', zorder=25,
                                      bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="black", alpha=0.9, lw=1.5))
 
@@ -1921,20 +1918,14 @@ class UltimateShipAnalyzer(QMainWindow):
                     for eid, sub_list in self.edge_q_results.items():
                         thk = self.graph_edges[eid].get('thickness', 10.0)
                         if thk < 0.1: thk = 0.1
-
                         for chunk in sub_list:
-                            tau_start = abs(chunk['q_start_unit'] * user_vy / thk)
-                            tau_end = abs(chunk['q_end_unit'] * user_vy / thk)
-                            max_tau = max(max_tau, tau_start, tau_end)
+                            tau_start = chunk['q_start_unit'] * user_vy / thk
+                            tau_end = chunk['q_end_unit'] * user_vy / thk
+                            max_tau = max(max_tau, abs(tau_start), abs(tau_end))
 
                     nodes_arr = np.array(list(self.graph_nodes.values()))
-                    if len(nodes_arr) > 0:
-                        max_dim = max(nodes_arr[:, 0].max() - nodes_arr[:, 0].min(),
-                                      nodes_arr[:, 1].max() - nodes_arr[:, 1].min())
-                        cx_hull, cy_hull = np.mean(nodes_arr, axis=0)
-                    else:
-                        max_dim = 10000.0
-                        cx_hull, cy_hull = 0.0, 0.0
+                    max_dim = max(nodes_arr[:, 0].max() - nodes_arr[:, 0].min(),
+                                  nodes_arr[:, 1].max() - nodes_arr[:, 1].min()) if len(nodes_arr) > 0 else 10000.0
 
                     visual_scale = (max_dim * 0.05) / max_tau if max_tau > 1e-9 else 1.0
                     cmap = cm.turbo
@@ -1947,37 +1938,31 @@ class UltimateShipAnalyzer(QMainWindow):
 
                         if res_list:
                             geom_c = list(edge_data['geometry'].coords)
-                            mid_pt = geom_c[len(geom_c) // 2]
-                            v_inward = np.array([cx_hull - mid_pt[0], cy_hull - mid_pt[1]])
-
                             dx = geom_c[-1][0] - geom_c[0][0]
                             dy = geom_c[-1][1] - geom_c[0][1]
-                            base_n = np.array([-dy, dx])
-
                             base_tg = np.array([dx, dy])
                             if np.linalg.norm(base_tg) > 1e-6:
                                 base_tg = base_tg / np.linalg.norm(base_tg)
                             else:
                                 base_tg = np.array([1.0, 0.0])
 
-                            flip_n = -1.0 if np.dot(base_n, v_inward) < 0 else 1.0
+                            is_fwd = res_list[0].get('is_forward', True)
+                            chunks_ordered = res_list if is_fwd else list(reversed(res_list))
 
-                            for chunk in res_list:
+                            all_c_pts, all_top_pts, all_taus = [], [], []
+
+                            for chunk in chunks_ordered:
                                 sub_geom = chunk['geom']
-                                is_fwd = chunk.get('is_forward', True)
-
                                 tau_s_signed = (chunk['q_start_unit'] * user_vy) / thk
                                 tau_e_signed = (chunk['q_end_unit'] * user_vy) / thk
 
                                 c = np.array(sub_geom.coords)
                                 num_pts = len(c)
 
-                                if is_fwd:
-                                    taus_signed = np.linspace(tau_s_signed, tau_e_signed, num_pts)
-                                else:
-                                    taus_signed = np.linspace(tau_e_signed, tau_s_signed, num_pts)
-
-                                taus = np.abs(taus_signed)
+                                # 부호 방향성 유지 데이터 매핑
+                                taus_signed = np.linspace(tau_s_signed, tau_e_signed,
+                                                          num_pts) if is_fwd else np.linspace(tau_e_signed,
+                                                                                              tau_s_signed, num_pts)
 
                                 n_vecs = np.zeros_like(c)
                                 for p_idx in range(num_pts):
@@ -1991,32 +1976,37 @@ class UltimateShipAnalyzer(QMainWindow):
                                         tg = c[p_idx + 1] - c[p_idx - 1]
 
                                     tg_len = np.linalg.norm(tg)
-                                    if tg_len > 1e-6:
-                                        tg = tg / tg_len
-                                    else:
-                                        tg = base_tg
+                                    tg = tg / tg_len if tg_len > 1e-6 else base_tg
+                                    n_vecs[p_idx] = np.array([-tg[1], tg[0]])
 
-                                    n_vecs[p_idx] = np.array([-tg[1], tg[0]]) * flip_n
+                                # 🟩 [요구사항 반영] 절대값(abs)을 완전히 삭제하여 부호에 따라 방향 자동 결정
+                                top_pts = c + n_vecs * (taus_signed[:, np.newaxis] * visual_scale)
 
-                                top_pts = c + n_vecs * (taus[:, np.newaxis] * visual_scale)
+                                if len(all_c_pts) > 0:
+                                    all_c_pts.extend(c[1:])
+                                    all_top_pts.extend(top_pts[1:])
+                                    all_taus.extend(taus_signed[1:])
+                                else:
+                                    all_c_pts.extend(c)
+                                    all_top_pts.extend(top_pts)
+                                    all_taus.extend(taus_signed)
 
-                                tau_mid_abs = abs((tau_s_signed + tau_e_signed) / 2.0)
-                                face_color = cmap(norm(tau_mid_abs))
+                            all_c_pts, all_top_pts, all_taus = np.array(all_c_pts), np.array(all_top_pts), np.array(
+                                all_taus)
+                            face_color = cmap(norm(np.mean(np.abs(all_taus))))
 
-                                poly_x = list(c[:, 0]) + list(top_pts[::-1, 0])
-                                poly_y = list(c[:, 1]) + list(top_pts[::-1, 1])
+                            poly_x = list(all_c_pts[:, 0]) + list(all_top_pts[::-1, 0])
+                            poly_y = list(all_c_pts[:, 1]) + list(all_top_pts[::-1, 1])
 
-                                # ✨ 1. 테두리나 해치선 없이 반투명한 색상으로만 칠하여 자연스러운 겹침 유도
-                                ax2.fill(poly_x, poly_y, color=face_color, alpha=0.6, edgecolor='none', zorder=8)
+                            ax2.fill(poly_x, poly_y, color=face_color, alpha=0.6, edgecolor='none', zorder=8)
+                            ax2.plot(all_top_pts[:, 0], all_top_pts[:, 1], color=face_color, linewidth=1.5, zorder=9)
 
-                            # ✨ 2. 조각(Chunk)을 그리는 내부 루프를 빠져나와, 원본 부재 전체의 선을 한 번에 그림 (끊김 원천 차단)
                             geom = edge_data['geometry']
                             ax2.plot(*geom.xy, color='black', linewidth=1.5, zorder=10, picker=5, gid=f"edge_{eid}")
-
                         else:
                             geom = edge_data['geometry']
-                            ax2.plot(*geom.xy, color='dodgerblue', linewidth=2.5, alpha=0.8,
-                                     zorder=10, picker=5, gid=f"edge_{eid}")
+                            ax2.plot(*geom.xy, color='dodgerblue', linewidth=2.5, alpha=0.8, zorder=10, picker=5,
+                                     gid=f"edge_{eid}")
 
                     cut_edge_ids = [c['edge_id'] for c in self.cut_edges_info] if hasattr(self,
                                                                                           'cut_edges_info') else []
@@ -2028,24 +2018,16 @@ class UltimateShipAnalyzer(QMainWindow):
                     sm = plt.cm.ScalarMappable(cmap=cmap, norm=norm)
                     sm.set_array([])
                     self.cbar = self.fig2.colorbar(sm, ax=ax2, fraction=0.046, pad=0.04)
-
-                    user_vy = getattr(self, 'user_Vy_total', 0)
-                    label_text = f'Shear Stress |τ_d| (MPa)\n[Total Vy = {user_vy:,.0f} N 적용]'
-                    self.cbar.set_label(label_text, fontweight='bold', fontsize=10)
-
-                else:
-                    for edge in self.graph_edges:
-                        geom = edge['geometry']
-                        ax2.plot(*geom.xy, color='dodgerblue', linewidth=2.5, alpha=0.8, zorder=10, picker=5,
-                                 gid=f"edge_{edge['id']}")
+                    self.cbar.set_label(f'Signed Shear Stress τ_d (MPa)\n[Total Vy = {user_vy:,.0f} N 적용]',
+                                        fontweight='bold', fontsize=10)
 
                 node_xs = [pt[0] for pt in self.graph_nodes.values()]
                 node_ys = [pt[1] for pt in self.graph_nodes.values()]
                 ax2.scatter(node_xs, node_ys, color='red', s=40, zorder=20, edgecolors='black')
 
                 for nid, pt in self.graph_nodes.items():
-                    ax2.annotate(str(nid), (pt[0], pt[1]), xytext=(4, 4), textcoords='offset points',
-                                 color='black', fontsize=9, fontweight='bold', zorder=25)
+                    ax2.annotate(str(nid), (pt[0], pt[1]), xytext=(4, 4), textcoords='offset points', color='black',
+                                 fontsize=9, fontweight='bold', zorder=25)
 
                 if hasattr(self, 'flowchart_slit_nodes') and self.flowchart_slit_nodes:
                     for i, nid in enumerate(self.flowchart_slit_nodes):
@@ -2140,13 +2122,10 @@ class UltimateShipAnalyzer(QMainWindow):
         return final_nodes
 
     def calculate_determinate_shear_flow(self, Vy_total=1000000.0):
-        """대칭 단면 1/mm 단위 정정전단류 계산 (스티프너 제외, 독자적 Ixx 계산)"""
+        """선체 단면 그래프(스티프너 제외 반단면)에 대해 이너시아를 새로 구하여 정정전단류 계산"""
         nodes = self.graph_nodes
 
-        # ====================================================================
-        # ✨ 스티프너를 제외한 순수 외판/격벽 부재만 필터링하여 대상 edges 지정
-        # (기존 선체 전체 데이터를 건드리지 않고 이 함수 내부 계산용으로만 사용)
-        # ====================================================================
+        # 스티프너를 제외한 순수 선체(외판 및 격벽) 부재만 필터링
         edges = {}
         for eid, e_info in self.remaining_edges_info.items():
             if self.graph_edges[eid].get('type') != 'stiffener':
@@ -2154,7 +2133,7 @@ class UltimateShipAnalyzer(QMainWindow):
 
         from shapely.ops import substring
 
-        # 1. 단면적 및 중립축(NA_y) 새로 계산 (스티프너 제외)
+        # 1. 스티프너를 제외한 반단면 기준 단면적 및 중립축(NA_y) 계산
         total_area = 0.0
         sum_qx = 0.0
         for eid, e in edges.items():
@@ -2170,8 +2149,8 @@ class UltimateShipAnalyzer(QMainWindow):
         if total_area < 1e-6: return
         na_y = sum_qx / total_area
 
-        # 2. I_xx 새로 계산 (스티프너 제외)
-        ixx = 0.0
+        # 2. 스티프너를 제외한 반단면 기준 이너시아(Ixx_half) 계산
+        ixx_half = 0.0
         for eid, e in edges.items():
             geom = self.graph_edges[eid]['geometry']
             thk = self.graph_edges[eid].get('thickness', 10.0)
@@ -2184,9 +2163,14 @@ class UltimateShipAnalyzer(QMainWindow):
                 c = list(sub.coords)
                 dy = c[-1][1] - c[0][1]
                 i_local = a * (dy ** 2) / 12.0
-                ixx += i_local + a * (yc - na_y) ** 2
+                ixx_half += i_local + a * (yc - na_y) ** 2
 
-        if ixx == 0: return
+        if ixx_half == 0: return
+
+        # 전단류 계산에 쓰인 이너시아 값 및 단면 특성 저장 (반단면 및 전체 단면)
+        self.shear_calc_ixx_half = ixx_half
+        self.shear_calc_ixx_full = ixx_half * 2
+        self.shear_calc_na_y = na_y
 
         # 3. 순서도 초기화 단계
         from collections import defaultdict
@@ -2203,7 +2187,6 @@ class UltimateShipAnalyzer(QMainWindow):
 
         # 4. 순서도 기반 경로 탐색 및 300mm 분할 누적 계산
         while True:
-            # [Phase 1] 자유 노드
             path_started = False
             for n, deg in nm.items():
                 if deg == 1 and vn[n] == 0:
@@ -2251,8 +2234,8 @@ class UltimateShipAnalyzer(QMainWindow):
                             y_bar = sub_geom.centroid.y - na_y
                             dS_z = A_sub * y_bar
 
-                            # ✨ 새로 구한 ixx와 na_y를 사용하여 전단류 증분 계산
-                            dq_unit = - (0.5 / ixx) * dS_z
+                            # 반단면 ixx_half를 분모에 대입하여 전체 전단력 분산 비율 계산
+                            dq_unit = - (0.5 / ixx_half) * dS_z
                             q_next_unit = q_curr_unit + dq_unit
 
                             sub_results.append({
@@ -2273,7 +2256,6 @@ class UltimateShipAnalyzer(QMainWindow):
                         if nm[j_next] == 1 or nm[j_next] >= 3:
                             break
 
-            # [Phase 2] 교차점 슈퍼포지션
             if not path_started:
                 bridge_started = False
                 for n, deg in nm.items():
@@ -2329,8 +2311,7 @@ class UltimateShipAnalyzer(QMainWindow):
                                     y_bar = sub_geom.centroid.y - na_y
                                     dS_z = A_sub * y_bar
 
-                                    # ✨ 새로 구한 ixx와 na_y를 사용하여 전단류 증분 계산
-                                    dq_unit = - (0.5 / ixx) * dS_z
+                                    dq_unit = - (0.5 / ixx_half) * dS_z
                                     q_next_unit = q_curr_unit + dq_unit
 
                                     sub_results.append({
