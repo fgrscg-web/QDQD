@@ -1449,6 +1449,8 @@ class UltimateShipAnalyzer(QMainWindow):
                 ixxm = ixx / 1e12
 
                 # 추후 전단응력 계산 등을 위해 클래스 변수에 저장
+                self.pure_hull_ixx_half = ixx
+                self.pure_hull_na_y = na_y
                 self.calc_total_area = total_area
                 self.calc_na_bl = na_y
                 self.calc_ixx = ixxm
@@ -1465,6 +1467,16 @@ class UltimateShipAnalyzer(QMainWindow):
                 calc_result_text = "\n\n❌ 유효한 단면적이 없어 이너시아를 계산할 수 없습니다."
 
             # 3. 결과창 출력 텍스트 업데이트
+            ixx_text = ""
+            if hasattr(self, 'pure_hull_ixx_half'):
+                ixx_total = self.pure_hull_ixx_half * 2
+                ixx_text = (
+                    f"\n\n🟦 [Section Properties (Stiffeners Excluded)]\n"
+                    f"- 중립축 (N.A) : {self.pure_hull_na_y:,.2f} mm\n"
+                    f"- 반단면 Ixx  : {self.pure_hull_ixx_half:,.0f} mm⁴\n"
+                    f"- 전체 Ixx    : {ixx_total:,.0f} mm⁴ (계산 반영값)"
+                )
+
             summary_text = (
                 "✅ 1D Transformation & Full Healing Complete!\n\n"
                 f"- Extracted Outer Hull Lines (1999): {len(cl1999)}\n"
@@ -1472,7 +1484,9 @@ class UltimateShipAnalyzer(QMainWindow):
                 f"- Added Stiffeners (6001~9001): {len(stiff_cl)}\n"
                 f"- Final Healed Elements: {len(all_cl)}"
                 f"{calc_result_text}"
-                f"{self.graph_summary}"  # ✨ 추가됨
+                f"{self.graph_summary}"
+                f"{getattr(self, 'cell_summary', '')}"
+                f"{ixx_text}"  # ✨ 위에서 만든 텍스트 추가
             )
             self.result_box.setText(summary_text)
 
@@ -2126,17 +2140,26 @@ class UltimateShipAnalyzer(QMainWindow):
         return final_nodes
 
     def calculate_determinate_shear_flow(self, Vy_total=1000000.0):
-        """대칭 단면 1/mm 단위 정정전단류 계산 (빌지 곡선 보존 및 300mm 분할 반복)"""
+        """대칭 단면 1/mm 단위 정정전단류 계산 (스티프너 제외, 독자적 Ixx 계산)"""
         nodes = self.graph_nodes
-        edges = self.remaining_edges_info
+
+        # ====================================================================
+        # ✨ 스티프너를 제외한 순수 외판/격벽 부재만 필터링하여 대상 edges 지정
+        # (기존 선체 전체 데이터를 건드리지 않고 이 함수 내부 계산용으로만 사용)
+        # ====================================================================
+        edges = {}
+        for eid, e_info in self.remaining_edges_info.items():
+            if self.graph_edges[eid].get('type') != 'stiffener':
+                edges[eid] = e_info
+
         from shapely.ops import substring
 
-        # 1. 단면적 및 중립축(NA_y) 정밀 계산 (곡선 기하학 직접 반영)
+        # 1. 단면적 및 중립축(NA_y) 새로 계산 (스티프너 제외)
         total_area = 0.0
         sum_qx = 0.0
         for eid, e in edges.items():
             geom = self.graph_edges[eid]['geometry']
-            thk = self.graph_edges[eid]['thickness']
+            thk = self.graph_edges[eid].get('thickness', 10.0)
             L = geom.length
             if L < 1e-6: continue
             a = L * thk
@@ -2147,11 +2170,11 @@ class UltimateShipAnalyzer(QMainWindow):
         if total_area < 1e-6: return
         na_y = sum_qx / total_area
 
-        # 2. I_xx 정밀 계산 (곡선을 50mm 단위로 미세 분할하여 평행축 정리 누적)
+        # 2. I_xx 새로 계산 (스티프너 제외)
         ixx = 0.0
         for eid, e in edges.items():
             geom = self.graph_edges[eid]['geometry']
-            thk = self.graph_edges[eid]['thickness']
+            thk = self.graph_edges[eid].get('thickness', 10.0)
             num_chunks = max(1, int(geom.length / 50.0))
             chunk_len = geom.length / num_chunks
             for i in range(num_chunks):
@@ -2199,9 +2222,8 @@ class UltimateShipAnalyzer(QMainWindow):
 
                         j_next = edges[m]['v'] if edges[m]['u'] == i_curr else edges[m]['u']
 
-                        # 곡선 기하학 및 진행 방향 판별
                         geom = self.graph_edges[m]['geometry']
-                        thk = self.graph_edges[m]['thickness']
+                        thk = self.graph_edges[m].get('thickness', 10.0)
                         coord_u = nodes[i_curr]
                         geom_start = geom.coords[0]
                         geom_end = geom.coords[-1]
@@ -2210,7 +2232,6 @@ class UltimateShipAnalyzer(QMainWindow):
                         dist_to_end = np.hypot(coord_u[0] - geom_end[0], coord_u[1] - geom_end[1])
                         is_forward = dist_to_start < dist_to_end
 
-                        # 300mm 단위로 곡선 경로 분할 계산
                         L_total = geom.length
                         num_chunks = max(1, int(np.ceil(L_total / 300.0)))
 
@@ -2230,6 +2251,7 @@ class UltimateShipAnalyzer(QMainWindow):
                             y_bar = sub_geom.centroid.y - na_y
                             dS_z = A_sub * y_bar
 
+                            # ✨ 새로 구한 ixx와 na_y를 사용하여 전단류 증분 계산
                             dq_unit = - (0.5 / ixx) * dS_z
                             q_next_unit = q_curr_unit + dq_unit
 
@@ -2237,7 +2259,7 @@ class UltimateShipAnalyzer(QMainWindow):
                                 'geom': sub_geom,
                                 'q_start_unit': q_curr_unit,
                                 'q_end_unit': q_next_unit,
-                                'is_forward': is_forward  # ✨ 렌더링 방향 일치를 위해 플래그 저장 추가
+                                'is_forward': is_forward
                             })
                             q_curr_unit = q_next_unit
 
@@ -2279,7 +2301,7 @@ class UltimateShipAnalyzer(QMainWindow):
                                 j_next = edges[m]['v'] if edges[m]['u'] == i_curr else edges[m]['u']
 
                                 geom = self.graph_edges[m]['geometry']
-                                thk = self.graph_edges[m]['thickness']
+                                thk = self.graph_edges[m].get('thickness', 10.0)
                                 coord_u = nodes[i_curr]
                                 geom_start = geom.coords[0]
                                 geom_end = geom.coords[-1]
@@ -2307,6 +2329,7 @@ class UltimateShipAnalyzer(QMainWindow):
                                     y_bar = sub_geom.centroid.y - na_y
                                     dS_z = A_sub * y_bar
 
+                                    # ✨ 새로 구한 ixx와 na_y를 사용하여 전단류 증분 계산
                                     dq_unit = - (0.5 / ixx) * dS_z
                                     q_next_unit = q_curr_unit + dq_unit
 
@@ -2314,7 +2337,7 @@ class UltimateShipAnalyzer(QMainWindow):
                                         'geom': sub_geom,
                                         'q_start_unit': q_curr_unit,
                                         'q_end_unit': q_next_unit,
-                                        'is_forward': is_forward  # ✨ 렌더링 방향 일치를 위해 플래그 저장 추가
+                                        'is_forward': is_forward
                                     })
                                     q_curr_unit = q_next_unit
 
