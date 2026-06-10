@@ -1382,6 +1382,9 @@ class UltimateShipAnalyzer(QMainWindow):
             progress.setLabelText("Building Mathematical Graph...")
             self.build_graph()
 
+            progress.setLabelText("Detecting Closed Cells (Loops)...")
+            self.detect_closed_cells()
+
             progress.setLabelText("Executing Flowchart Algorithm...")
             self.execute_flowchart_algorithm()
 
@@ -1888,7 +1891,6 @@ class UltimateShipAnalyzer(QMainWindow):
                         poly = cinfo['polygon']
                         cid = cinfo['cell_id']
 
-                        # 방 한가운데에 Cell 번호 뱃지만 텍스트로 생성 (배경색 칠하기 생략)
                         cx, cy = poly.centroid.x, poly.centroid.y
                         ax2.annotate(f"Cell {cid}", (cx, cy),
                                      color='black', weight='bold', fontsize=12,
@@ -1902,105 +1904,106 @@ class UltimateShipAnalyzer(QMainWindow):
                     max_tau = 1e-9
                     user_vy = getattr(self, 'user_Vy_total', 1000000.0)
 
-                    # 최대 전단응력 계산
                     for eid, sub_list in self.edge_q_results.items():
-                        thk = self.graph_edges[eid]['thickness']
+                        thk = self.graph_edges[eid].get('thickness', 10.0)
+                        if thk < 0.1: thk = 0.1
+
                         for chunk in sub_list:
                             tau_start = abs(chunk['q_start_unit'] * user_vy / thk)
                             tau_end = abs(chunk['q_end_unit'] * user_vy / thk)
                             max_tau = max(max_tau, tau_start, tau_end)
 
-                    # ✨ 화면 스케일 계산: 선체 높이/너비의 5% 정도를 최대 응력의 시각적 두께로 변환
                     nodes_arr = np.array(list(self.graph_nodes.values()))
                     if len(nodes_arr) > 0:
                         max_dim = max(nodes_arr[:, 0].max() - nodes_arr[:, 0].min(),
                                       nodes_arr[:, 1].max() - nodes_arr[:, 1].min())
+                        cx_hull, cy_hull = np.mean(nodes_arr, axis=0)
                     else:
                         max_dim = 10000.0
+                        cx_hull, cy_hull = 0.0, 0.0
 
                     visual_scale = (max_dim * 0.05) / max_tau if max_tau > 1e-9 else 1.0
-
                     cmap = cm.turbo
                     norm = mcolors.Normalize(vmin=0, vmax=max_tau)
 
-                    # 수직 막대(다각형) 렌더링
                     for eid, edge_data in enumerate(self.graph_edges):
                         res_list = self.edge_q_results.get(eid)
-                        thk = edge_data['thickness']
+                        thk = edge_data.get('thickness', 10.0)
+                        if thk < 0.1: thk = 0.1
+
                         if res_list:
+                            geom_c = list(edge_data['geometry'].coords)
+                            mid_pt = geom_c[len(geom_c) // 2]
+                            v_inward = np.array([cx_hull - mid_pt[0], cy_hull - mid_pt[1]])
+
+                            dx = geom_c[-1][0] - geom_c[0][0]
+                            dy = geom_c[-1][1] - geom_c[0][1]
+                            base_n = np.array([-dy, dx])
+
+                            base_tg = np.array([dx, dy])
+                            if np.linalg.norm(base_tg) > 1e-6:
+                                base_tg = base_tg / np.linalg.norm(base_tg)
+                            else:
+                                base_tg = np.array([1.0, 0.0])
+
+                            flip_n = -1.0 if np.dot(base_n, v_inward) < 0 else 1.0
+
                             for chunk in res_list:
                                 sub_geom = chunk['geom']
                                 is_fwd = chunk.get('is_forward', True)
 
-                                tau_s = (chunk['q_start_unit'] * user_vy) / thk
-                                tau_e = (chunk['q_end_unit'] * user_vy) / thk
+                                tau_s_signed = (chunk['q_start_unit'] * user_vy) / thk
+                                tau_e_signed = (chunk['q_end_unit'] * user_vy) / thk
 
                                 c = np.array(sub_geom.coords)
                                 num_pts = len(c)
 
-                                # 기하학 방향과 수치 배열 동기화
                                 if is_fwd:
-                                    taus = np.linspace(tau_s, tau_e, num_pts)
+                                    taus_signed = np.linspace(tau_s_signed, tau_e_signed, num_pts)
                                 else:
-                                    taus = np.linspace(tau_e, tau_s, num_pts)
+                                    taus_signed = np.linspace(tau_e_signed, tau_s_signed, num_pts)
 
-                                    # ====================================================================
-                                    # ✨ 수직 방향 엄격화: 선분 전체가 아닌 각 점(Point)마다 완벽한 직교 벡터 도출
-                                    # ====================================================================
+                                taus = np.abs(taus_signed)
+
                                 n_vecs = np.zeros_like(c)
                                 for p_idx in range(num_pts):
-                                    # 1. 접선(Tangent) 벡터 계산
                                     if num_pts == 2:
                                         tg = c[1] - c[0]
                                     elif p_idx == 0:
-                                        tg = c[1] - c[0]  # 전진 차분
+                                        tg = c[1] - c[0]
                                     elif p_idx == num_pts - 1:
-                                        tg = c[-1] - c[-2]  # 후진 차분
+                                        tg = c[-1] - c[-2]
                                     else:
-                                        # 곡선부를 위한 중심 차분법(Central Difference): 양옆 점을 이은 완만한 접선
                                         tg = c[p_idx + 1] - c[p_idx - 1]
 
-                                        # 2. 크기를 1로 정규화(Normalize)하고 90도 회전
                                     tg_len = np.linalg.norm(tg)
                                     if tg_len > 1e-6:
                                         tg = tg / tg_len
-                                        # 반시계 방향 90도 직교 벡터 산출
-                                        n_vecs[p_idx] = np.array([-tg[1], tg[0]])
                                     else:
-                                        n_vecs[p_idx] = np.array([0, 1])
+                                        tg = base_tg
 
-                                # 수직 돌출부 (막대의 상단 라인): 각 점마다 자신의 고유한 법선 벡터를 따라 돌출됨
+                                    n_vecs[p_idx] = np.array([-tg[1], tg[0]]) * flip_n
+
                                 top_pts = c + n_vecs * (taus[:, np.newaxis] * visual_scale)
 
-                                # 다각형 좌표 결합 (바닥선 -> 상단 역방향)
-                                poly_x = list(c[:, 0]) + list(top_pts[::-1, 0])
-                                poly_y = list(c[:, 1]) + list(top_pts[::-1, 1])
-                                # ====================================================================
-
-                                tau_mid_abs = abs((tau_s + tau_e) / 2.0)
+                                tau_mid_abs = abs((tau_s_signed + tau_e_signed) / 2.0)
                                 face_color = cmap(norm(tau_mid_abs))
 
-                                # 1. 막대 내부 색상 칠하기 (반투명)
-                                ax2.fill(poly_x, poly_y, color=face_color, alpha=0.5, edgecolor='none', zorder=8)
+                                poly_x = list(c[:, 0]) + list(top_pts[::-1, 0])
+                                poly_y = list(c[:, 1]) + list(top_pts[::-1, 1])
 
-                                # 2. 막대 외곽선(상단) 그리기
-                                ax2.plot(top_pts[:, 0], top_pts[:, 1], color=face_color, linewidth=1.5, zorder=9)
+                                # ✨ 1. 테두리나 해치선 없이 반투명한 색상으로만 칠하여 자연스러운 겹침 유도
+                                ax2.fill(poly_x, poly_y, color=face_color, alpha=0.6, edgecolor='none', zorder=8)
 
-                                # 3. 막대그래프 구획 해치(Hatch)선 그리기
-                                ax2.plot([c[0, 0], top_pts[0, 0]], [c[0, 1], top_pts[0, 1]],
-                                         color=face_color, linewidth=0.8, alpha=0.7, zorder=9)
-                                ax2.plot([c[-1, 0], top_pts[-1, 0]], [c[-1, 1], top_pts[-1, 1]],
-                                         color=face_color, linewidth=0.8, alpha=0.7, zorder=9)
+                            # ✨ 2. 조각(Chunk)을 그리는 내부 루프를 빠져나와, 원본 부재 전체의 선을 한 번에 그림 (끊김 원천 차단)
+                            geom = edge_data['geometry']
+                            ax2.plot(*geom.xy, color='black', linewidth=1.5, zorder=10, picker=5, gid=f"edge_{eid}")
 
-                                # 4. 기준선(Base line)은 검은색으로 고정하여 구조물 뼈대 강조 (클릭 이벤트 포함)
-                                ax2.plot(c[:, 0], c[:, 1], color='black', linewidth=1.5, zorder=10, picker=5,
-                                         gid=f"edge_{eid}")
                         else:
                             geom = edge_data['geometry']
                             ax2.plot(*geom.xy, color='dodgerblue', linewidth=2.5, alpha=0.8,
                                      zorder=10, picker=5, gid=f"edge_{eid}")
 
-                    # 슬릿 부재 가시화
                     cut_edge_ids = [c['edge_id'] for c in self.cut_edges_info] if hasattr(self,
                                                                                           'cut_edges_info') else []
                     for eid in cut_edge_ids:
@@ -2008,7 +2011,6 @@ class UltimateShipAnalyzer(QMainWindow):
                             geom = self.graph_edges[eid]['geometry']
                             ax2.plot(*geom.xy, color='#BDC3C7', linewidth=2.5, linestyle='--', zorder=5)
 
-                    # 컬러바 축 생성
                     sm = plt.cm.ScalarMappable(cmap=cmap, norm=norm)
                     sm.set_array([])
                     self.cbar = self.fig2.colorbar(sm, ax=ax2, fraction=0.046, pad=0.04)
