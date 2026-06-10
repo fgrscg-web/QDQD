@@ -75,7 +75,6 @@ class SlitViewerDialog(QDialog):
                 geom = all_edges[eid]['geometry']
                 ax.plot(*geom.xy, color='blue', linewidth=3, alpha=0.8, label='Connected (연결됨)')
 
-                # 원본 슬릿 노드와 이어져 있는 반대쪽 인접 노드 식별
                 adj_nid = e['v'] if e['u'] == self.slit_nid else e['u']
                 connected_nodes.add(adj_nid)
 
@@ -86,13 +85,9 @@ class SlitViewerDialog(QDialog):
                 geom = all_edges[eid]['geometry']
                 ax.plot(*geom.xy, color='red', linewidth=3, linestyle='--', alpha=0.8, label='Cut (분리됨)')
 
-                # 끊어져 나간 더미 노드 식별
                 dummy_nodes.add(cut_info['dummy_nid'])
 
-        # ========================================================
         # 3. 노드 마커 및 정보 라벨 그리기
-        # ========================================================
-
         # A. 메인 슬릿 노드
         center_pt = self.main_app.graph_nodes[self.slit_nid]
         ax.scatter(center_pt[0], center_pt[1], color='lime', marker='*', s=400, edgecolors='black', zorder=10)
@@ -107,20 +102,17 @@ class SlitViewerDialog(QDialog):
             ax.annotate(f"N{nid}\n(Adjacent)", (pt[0], pt[1]),
                         xytext=(8, -15), textcoords='offset points', color='blue', fontsize=9)
 
-        # C. 절단되어 새로 생성된 더미 노드들
+        # C. 절단되어 새로 생성된 더미 노드들 (✨ 오프셋 제거 및 완전 일치화)
         for nid in dummy_nodes:
             pt = self.main_app.graph_nodes[nid]
-            # 좌표가 원본과 100% 동일하므로 구분을 위해 팝업창에서만 시각적으로 살짝 빗겨나게 표시(Offset)
-            offset_x, offset_y = 10.0, 10.0
-            ax.scatter(pt[0] + offset_x, pt[1] + offset_y, color='red', marker='X', s=150, edgecolors='black',
-                       zorder=10)
-            ax.annotate(f"N{nid}\n(Dummy)", (pt[0] + offset_x, pt[1] + offset_y),
-                        xytext=(10, 5), textcoords='offset points', color='red', fontweight='bold', fontsize=9)
+            ax.scatter(pt[0], pt[1], color='red', marker='X', s=150, edgecolors='black', zorder=11)
+            # 라벨 텍스트만 메인 노드 텍스트와 겹치지 않게 아래쪽으로 표시
+            ax.annotate(f"N{nid}\n(Dummy)", (pt[0], pt[1]),
+                        xytext=(12, -25), textcoords='offset points', color='red', fontweight='bold', fontsize=9)
 
         ax.set_aspect('equal')
         ax.grid(True, linestyle=':', alpha=0.6)
 
-        # 범례 중복 방지
         handles, labels = ax.get_legend_handles_labels()
         by_label = dict(zip(labels, handles))
         if by_label:
@@ -1993,13 +1985,24 @@ class UltimateShipAnalyzer(QMainWindow):
 
                             all_c_pts, all_top_pts, all_taus = np.array(all_c_pts), np.array(all_top_pts), np.array(
                                 all_taus)
-                            face_color = cmap(norm(np.mean(np.abs(all_taus))))
+                            for idx_pt in range(len(all_c_pts) - 1):
+                                # 각 쪼개진 점과 점 사이의 작은 사각형 폴리곤 좌표 구성
+                                px = [all_c_pts[idx_pt, 0], all_c_pts[idx_pt + 1, 0], all_top_pts[idx_pt + 1, 0],
+                                      all_top_pts[idx_pt, 0]]
+                                py = [all_c_pts[idx_pt, 1], all_c_pts[idx_pt + 1, 1], all_top_pts[idx_pt + 1, 1],
+                                      all_top_pts[idx_pt, 1]]
 
-                            poly_x = list(all_c_pts[:, 0]) + list(all_top_pts[::-1, 0])
-                            poly_y = list(all_c_pts[:, 1]) + list(all_top_pts[::-1, 1])
+                                # 해당 미세 구간의 평균 절대 응력을 구해 개별 색상(Color) 추출
+                                c_val = np.mean(np.abs(all_taus[idx_pt:idx_pt + 2]))
+                                fc = cmap(norm(c_val))
 
-                            ax2.fill(poly_x, poly_y, color=face_color, alpha=0.6, edgecolor='none', zorder=8)
-                            ax2.plot(all_top_pts[:, 0], all_top_pts[:, 1], color=face_color, linewidth=1.5, zorder=9)
+                                # 반투명한 개별 폴리곤 렌더링 (경계선을 없애 자연스럽게 이어지도록 처리)
+                                ax2.fill(px, py, color=fc, alpha=0.6, edgecolor='none', zorder=8)
+
+                                # 상단 외곽선도 응력에 따라 그라데이션으로 변하도록 라인 렌더링
+                                ax2.plot([all_top_pts[idx_pt, 0], all_top_pts[idx_pt + 1, 0]],
+                                         [all_top_pts[idx_pt, 1], all_top_pts[idx_pt + 1, 1]],
+                                         color=fc, linewidth=1.5, zorder=9)
 
                             geom = edge_data['geometry']
                             ax2.plot(*geom.xy, color='black', linewidth=1.5, zorder=10, picker=5, gid=f"edge_{eid}")
@@ -2182,8 +2185,12 @@ class UltimateShipAnalyzer(QMainWindow):
         vn = defaultdict(int)
         vm = {eid: 0 for eid in edges}
 
+        # (기존 코드 생략...)
         node_flows_unit = defaultdict(dict)
         self.edge_q_results = {}
+
+        # ✨ [신규 추가] 부정정 해석을 위해 전단류가 흘러간 정확한 위상 경로와 방향 기록
+        self.calc_route = []
 
         # 4. 순서도 기반 경로 탐색 및 300mm 분할 누적 계산
         while True:
@@ -2215,10 +2222,19 @@ class UltimateShipAnalyzer(QMainWindow):
                         dist_to_end = np.hypot(coord_u[0] - geom_end[0], coord_u[1] - geom_end[1])
                         is_forward = dist_to_start < dist_to_end
 
+                        # ✨ [신규 추가] 부재 계산 방향 저장 (Phase 1)
+                        self.calc_route.append({
+                            'phase': 1,
+                            'edge_id': m,
+                            'from_node': i_curr,
+                            'to_node': j_next,
+                            'is_forward': is_forward
+                        })
+
                         L_total = geom.length
                         num_chunks = max(1, int(np.ceil(L_total / 300.0)))
-
                         sub_results = []
+                        # (중략... 아래 chunk 계산 루프는 기존과 완전 동일합니다)
                         for k in range(num_chunks):
                             if is_forward:
                                 d1 = k * (L_total / num_chunks)
@@ -2229,12 +2245,9 @@ class UltimateShipAnalyzer(QMainWindow):
 
                             sub_geom = substring(geom, min(d1, d2), max(d1, d2))
                             if sub_geom.length < 1e-6: continue
-
                             A_sub = sub_geom.length * thk
                             y_bar = sub_geom.centroid.y - na_y
                             dS_z = A_sub * y_bar
-
-                            # 반단면 ixx_half를 분모에 대입하여 전체 전단력 분산 비율 계산
                             dq_unit = - (0.5 / ixx_half) * dS_z
                             q_next_unit = q_curr_unit + dq_unit
 
@@ -2292,10 +2305,19 @@ class UltimateShipAnalyzer(QMainWindow):
                                 dist_to_end = np.hypot(coord_u[0] - geom_end[0], coord_u[1] - geom_end[1])
                                 is_forward = dist_to_start < dist_to_end
 
+                                # ✨ [신규 추가] 부재 계산 방향 저장 (Phase 2)
+                                self.calc_route.append({
+                                    'phase': 2,
+                                    'edge_id': m,
+                                    'from_node': i_curr,
+                                    'to_node': j_next,
+                                    'is_forward': is_forward
+                                })
+
                                 L_total = geom.length
                                 num_chunks = max(1, int(np.ceil(L_total / 300.0)))
-
                                 sub_results = []
+                                # (이하 chunk 계산 루프 기존과 동일...)
                                 for k in range(num_chunks):
                                     if is_forward:
                                         d1 = k * (L_total / num_chunks)
@@ -2306,11 +2328,9 @@ class UltimateShipAnalyzer(QMainWindow):
 
                                     sub_geom = substring(geom, min(d1, d2), max(d1, d2))
                                     if sub_geom.length < 1e-6: continue
-
                                     A_sub = sub_geom.length * thk
                                     y_bar = sub_geom.centroid.y - na_y
                                     dS_z = A_sub * y_bar
-
                                     dq_unit = - (0.5 / ixx_half) * dS_z
                                     q_next_unit = q_curr_unit + dq_unit
 
