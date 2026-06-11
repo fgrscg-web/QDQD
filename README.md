@@ -235,42 +235,157 @@ class CalcRouteViewerDialog(QDialog):
     def __init__(self, main_app):
         super().__init__(main_app)
         self.main_app = main_app
-        self.setWindowTitle("전단류 계산 경로(Calc Route) 뷰어")
-        self.resize(1000, 800)
+        self.setWindowTitle("전단류 계산 경로(Calc Route) 정밀 분석 및 q값 뷰어")
+        self.resize(1400, 800)
 
         layout = QVBoxLayout(self)
 
         info_label = QLabel(
             "<b>[정정 전단류($q_b$) 탐색 경로 및 방향 확인]</b><br>"
-            "<span style='color:green;'><b>Phase 1 (초록색)</b></span>: 자유단(Free end)에서 시작한 기본 탐색 경로 | "
-            "<span style='color:orange;'><b>Phase 2 (주황색)</b></span>: 폐단면 내부를 강제로 가르는 브릿지 탐색 경로<br>"
-            "화살표 방향이 프로그램이 전단류를 누적하며 나아간 실제 <b>계산 방향(from → to)</b>이며, 검은색 원 안의 숫자는 <b>탐색 순서</b>입니다."
+            "<span style='color:green;'><b>Phase 1 (초록색)</b></span>: 자유단 출발 | "
+            "<span style='color:orange;'><b>Phase 2 (주황색)</b></span>: 분기점 출발<br>"
+            "좌측 도면의 <b>색칠된 선분을 마우스로 클릭</b>하면 해당 부재의 전단류(q) 상세 변화량을 팝업으로 확인할 수 있습니다."
         )
         layout.addWidget(info_label)
 
+        splitter = QSplitter(Qt.Horizontal)
+
+        # --- 좌측: 도면 뷰어 ---
+        left_widget = QWidget()
+        left_layout = QVBoxLayout(left_widget)
+        left_layout.setContentsMargins(0, 0, 0, 0)
+
         self.fig = Figure()
         self.canvas = FigureCanvas(self.fig)
-        layout.addWidget(NavigationToolbar(self.canvas, self))
-        layout.addWidget(self.canvas)
+        left_layout.addWidget(NavigationToolbar(self.canvas, self))
+        left_layout.addWidget(self.canvas)
+        splitter.addWidget(left_widget)
+
+        # --- 우측: 텍스트 로그 패널 ---
+        right_widget = QWidget()
+        right_layout = QVBoxLayout(right_widget)
+        right_layout.setContentsMargins(0, 0, 0, 0)
+
+        right_layout.addWidget(QLabel("<b>📋 [단계별 탐색 경로 및 q값 추적 로그]</b>"))
+        self.log_box = QTextEdit()
+        self.log_box.setReadOnly(True)
+        self.log_box.setStyleSheet("font-family: Consolas, monospace; font-size: 13px; background-color: #F8F9FA;")
+        right_layout.addWidget(self.log_box)
+        splitter.addWidget(right_widget)
+
+        splitter.setSizes([900, 500])
+        layout.addWidget(splitter)
+
+        # ✨ 마우스 클릭 이벤트 연결
+        self.canvas.mpl_connect('pick_event', self.on_route_edge_click)
 
         self.plot_route()
+        self.populate_log()
+
+    def on_route_edge_click(self, event):
+        """좌측 도면에서 계산 경로 선분을 클릭했을 때 q값을 보여주는 팝업"""
+        if event.artist and hasattr(event.artist, 'get_gid'):
+            gid = event.artist.get_gid()
+            if gid is not None and str(gid).startswith("route_"):
+                eid = int(str(gid).split("_")[1])
+
+                # 클릭한 엣지의 탐색 경로 정보 찾기
+                route_info = next((r for r in self.main_app.calc_route if r['edge_id'] == eid), None)
+                if not route_info: return
+
+                phase = route_info.get('phase', 1)
+                u = route_info['from_node']
+                v = route_info['to_node']
+
+                info_text = f"🔹 <b>[탐색 경로 상세 정보]</b>\n"
+                info_text += f" - Edge ID : {eid}\n"
+                info_text += f" - 탐색 방향 : Node {u} ➔ Node {v}\n"
+                info_text += f" - Phase : {phase} ({'자유단 출발' if phase == 1 else '분기점 출발'})\n\n"
+
+                # q값 데이터 추출
+                if hasattr(self.main_app, 'edge_q_results') and eid in self.main_app.edge_q_results:
+                    chunks = self.main_app.edge_q_results[eid]
+
+                    # calc_route는 항상 from_node -> to_node 방향으로 생성되었으므로,
+                    # chunks의 첫 번째가 시작값, 마지막이 종료값입니다.
+                    q_s_unit = chunks[0]['q_start_unit']
+                    q_e_unit = chunks[-1]['q_end_unit']
+
+                    user_vy = getattr(self.main_app, 'user_Vy_total', 1000000.0)
+                    q_s_actual = q_s_unit * user_vy
+                    q_e_actual = q_e_unit * user_vy
+
+                    info_text += f"📊 <b>[정정 전단류(q_b) 계산 결과]</b>\n"
+                    info_text += f" - 🟢 시작점 (Node {u}) q 값 : {q_s_actual:,.2f} N/mm\n"
+                    info_text += f" - 🔴 종료점 (Node {v}) q 값 : {q_e_actual:,.2f} N/mm\n"
+
+                    diff = abs(q_e_actual) - abs(q_s_actual)
+                    status = "증가 ↗" if diff > 0.1 else ("감소 ↘" if diff < -0.1 else "유지 ➔")
+                    info_text += f" - 절댓값 흐름 : {status}\n"
+                else:
+                    info_text += f"❌ 전단류 계산 결과를 찾을 수 없습니다.\n"
+
+                QMessageBox.information(self, f"Route Edge {eid} (Node {u} ➔ {v})", info_text)
+
+    def populate_log(self):
+        """우측 텍스트 패널에 계산 경로와 q값을 순서대로 기록합니다."""
+        if not hasattr(self.main_app, 'calc_route') or not self.main_app.calc_route:
+            self.log_box.setText("계산 경로 데이터가 없습니다.")
+            return
+
+        log_html = ""
+        prev_to_node = None
+        path_count = 1
+
+        for i, route in enumerate(self.main_app.calc_route):
+            phase = route.get('phase', 1)
+            u = route['from_node']
+            v = route['to_node']
+            eid = route['edge_id']
+            fwd = route['is_forward']
+
+            color = "green" if phase == 1 else "darkorange"
+            phase_str = "자유단 출발" if phase == 1 else "분기점 출발"
+            dir_str = "순방향" if fwd else "역방향"
+
+            # 끊기고 새로운 경로가 시작될 때
+            if u != prev_to_node:
+                if i != 0:
+                    log_html += f"&nbsp;&nbsp; 🛑 <b>Path {path_count - 1} 종료 (End Node: {prev_to_node})</b><br><br>"
+                log_html += f"<span style='color:{color}; font-size:14px;'><b>🚀 [Path {path_count}] Phase {phase} ({phase_str})</b></span><br>"
+                log_html += f"&nbsp;&nbsp; 🟢 <b>시작 노드: Node {u}</b><br>"
+                path_count += 1
+
+            # q값 문자열 생성
+            q_text = ""
+            if hasattr(self.main_app, 'edge_q_results') and eid in self.main_app.edge_q_results:
+                chunks = self.main_app.edge_q_results[eid]
+                user_vy = getattr(self.main_app, 'user_Vy_total', 1000000.0)
+                qs = chunks[0]['q_start_unit'] * user_vy
+                qe = chunks[-1]['q_end_unit'] * user_vy
+                q_text = f" <span style='color:#003087; font-weight:bold;'>[q: {qs:,.0f} ➔ {qe:,.0f}]</span>"
+
+            # 개별 스텝 기록
+            log_html += f"&nbsp;&nbsp; [{i + 1:03d}] Node <b>{u}</b> ➔ Node <b>{v}</b> <span style='color:gray; font-size:11px;'>(Edge: {eid}, {dir_str})</span>{q_text}<br>"
+
+            prev_to_node = v
+
+        if prev_to_node is not None:
+            log_html += f"&nbsp;&nbsp; 🛑 <b>Path {path_count - 1} 최종 종료 (End Node: {prev_to_node})</b><br>"
+
+        self.log_box.setHtml(log_html)
 
     def plot_route(self):
         self.fig.clear()
         ax = self.fig.add_subplot(111)
 
-        # 1. 배경: 전체 에지를 옅은 회색으로 렌더링
         for e in self.main_app.graph_edges:
             geom = e['geometry']
             ax.plot(*geom.xy, color='#EEEEEE', linewidth=1, zorder=1)
 
         if not hasattr(self.main_app, 'calc_route') or not self.main_app.calc_route:
-            ax.text(0.5, 0.5, "계산 경로 데이터가 없습니다.\n먼저 1D 변환 및 정렬을 실행해주세요.",
-                    ha='center', va='center', transform=ax.transAxes, fontsize=12, weight='bold')
-            self.canvas.draw()
             return
 
-        # 2. 계산 경로(calc_route) 순회하며 렌더링
         for i, route in enumerate(self.main_app.calc_route):
             eid = route['edge_id']
             phase = route.get('phase', 1)
@@ -278,25 +393,23 @@ class CalcRouteViewerDialog(QDialog):
             edge_data = self.main_app.graph_edges[eid]
             geom_coords = np.array(edge_data['geometry'].coords)
 
-            # 계산이 진행된 방향(from_node -> to_node)에 맞춰 기하학 좌표계 정렬
             if route['from_node'] == edge_data['start_node']:
                 path_coords = geom_coords
             else:
                 path_coords = geom_coords[::-1]
 
-            # Phase에 따른 색상 분리
             color = 'limegreen' if phase == 1 else 'darkorange'
 
-            # 경로 선 그리기
-            ax.plot(path_coords[:, 0], path_coords[:, 1], color=color, linewidth=3.0, alpha=0.7, zorder=4)
+            # ✨ picker=5와 gid 속성을 추가하여 선분을 클릭 가능하게 만듦
+            ax.plot(path_coords[:, 0], path_coords[:, 1], color=color, linewidth=4.0, alpha=0.7, zorder=4, picker=5,
+                    gid=f"route_{eid}")
 
-            # 곡선의 중간 지점 부근에서 방향 화살표 추출
             from shapely.geometry import LineString
             geom_line = LineString(path_coords)
 
             if geom_line.length > 5.0:
                 pt_mid = geom_line.interpolate(0.5, normalized=True)
-                pt_next = geom_line.interpolate(0.55, normalized=True)  # 살짝 앞쪽을 향하는 벡터 추출
+                pt_next = geom_line.interpolate(0.55, normalized=True)
 
                 vec = np.array([pt_next.x - pt_mid.x, pt_next.y - pt_mid.y])
                 length = np.linalg.norm(vec)
@@ -305,16 +418,18 @@ class CalcRouteViewerDialog(QDialog):
                     arrow_len = min(geom_line.length * 0.3, 100.0)
                     dv = vec / length * arrow_len
 
-                    # 화살표 렌더링
                     ax.annotate('', xy=(pt_mid.x + dv[0], pt_mid.y + dv[1]),
                                 xytext=(pt_mid.x, pt_mid.y),
                                 arrowprops=dict(arrowstyle="->", color=color, lw=3.0, shrinkA=0, shrinkB=0),
                                 zorder=5)
 
-                    # 탐색 순서(Index)를 검은색 동그라미로 표시 (디버깅 용도)
-                    ax.annotate(str(i + 1), (pt_mid.x, pt_mid.y), color='white', weight='bold', fontsize=3,
+                    ax.annotate(str(i + 1), (pt_mid.x, pt_mid.y), color='white', weight='bold', fontsize=6,
                                 ha='center', va='center', zorder=6,
-                                bbox=dict(boxstyle="round,pad=0.1", fc='black', ec='none', alpha=0.8))
+                                bbox=dict(boxstyle="circle,pad=0.1", fc='black', ec='none', alpha=0.8))
+
+        # 배경에 노드 번호를 옅게 표시하여 클릭 지점 추적을 쉽게 함
+        for nid, pt in self.main_app.graph_nodes.items():
+            ax.annotate(str(nid), (pt[0], pt[1]), color='#7F8C8D', fontsize=8, ha='center', va='center', zorder=10)
 
         ax.set_aspect('equal')
         ax.grid(True, linestyle=':', alpha=0.6)
@@ -2293,8 +2408,11 @@ class UltimateShipAnalyzer(QMainWindow):
 
                                     tg_len = np.linalg.norm(tg)
                                     tg = tg / tg_len if tg_len > 1e-6 else base_tg
-                                    n_vecs[p_idx] = np.array([-tg[1], tg[0]])
+                                    if not is_fwd:
+                                        tg = -tg
 
+                                    # Normal Vector 계산
+                                    n_vecs[p_idx] = np.array([-tg[1], tg[0]])
                                 top_pts = c + n_vecs * (taus_signed[:, np.newaxis] * visual_scale)
 
                                 if len(all_c_pts) > 0:
