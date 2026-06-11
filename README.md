@@ -502,37 +502,52 @@ class MatrixViewerDialog(QDialog):
         self.table_mat.resizeColumnsToContents()
         layout.addWidget(self.table_mat, stretch=2)
 
-        # --- 2. 우변 벡터 {-Δ_0} 테이블 생성 ---
-        layout.addWidget(QLabel("<h3>✅ 2. 우변 벡터 {-Δ_0} (Initial Twist Term)</h3>"))
-        self.table_vec = QTableWidget(num_cells, 3)
-        self.table_vec.setHorizontalHeaderLabels(["Cell ID", "초기 비틀림 적분 (Δ_i0)", "우변 방정식 적용 (-Δ_i0)"])
-        self.table_vec.verticalHeader().setVisible(False)  # 왼쪽 기본 인덱스 숨김
+        # --- 2. 우변 벡터 및 q0 테이블 생성 ---
+        has_q0 = hasattr(self.main_app, 'solved_q0')
+        col_count = 4 if has_q0 else 3
+
+        layout.addWidget(QLabel("<h3>✅ 2. 우변 벡터 및 부정정 전단류(q_0) 해답</h3>"))
+        self.table_vec = QTableWidget(num_cells, col_count)
+
+        headers = ["Cell ID", "초기 비틀림 적분 (Δ_i0)", "우변 방정식 적용 (-Δ_i0)"]
+        if has_q0: headers.append("도출된 전단류 해 (q_0)")
+
+        self.table_vec.setHorizontalHeaderLabels(headers)
+        self.table_vec.verticalHeader().setVisible(False)  # 왼쪽 인덱스 숨김
 
         for i in range(num_cells):
             cid = self.main_app.cells_info[i]['cell_id']
             val = vec[i]
 
-            # Cell ID 컬럼
+            # 1. Cell ID
             item_id = QTableWidgetItem(f"Cell {cid}")
             item_id.setTextAlignment(Qt.AlignCenter)
             item_id.setFont(font_bold)
             item_id.setBackground(QColor("#ECEFF1"))
             self.table_vec.setItem(i, 0, item_id)
 
-            # Δ_i0 (원래 값)
+            # 2. 원래 적분값
             item_val1 = QTableWidgetItem(f"{val:,.2f}")
             item_val1.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
             self.table_vec.setItem(i, 1, item_val1)
 
-            # -Δ_i0 (부호 뒤집힌 최종 적용 값)
+            # 3. 우변 적용값
             item_val2 = QTableWidgetItem(f"{-val:,.2f}")
             item_val2.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
             item_val2.setFont(font_bold)
-            color = "crimson" if -val < 0 else "dodgerblue"
-            item_val2.setForeground(QBrush(QColor(color)))
+            item_val2.setForeground(QBrush(QColor("crimson" if -val < 0 else "dodgerblue")))
             self.table_vec.setItem(i, 2, item_val2)
 
-        # 벡터 테이블은 창 너비에 맞춰 꽉 차게 조절
+            # 4. (추가) 계산된 q0 해답
+            if has_q0:
+                q0_val = self.main_app.solved_q0[i]
+                item_q0 = QTableWidgetItem(f"{q0_val:,.2f} N/mm")
+                item_q0.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                item_q0.setFont(font_bold)
+                item_q0.setForeground(QBrush(QColor("darkmagenta")))  # 강조된 보라색
+                item_q0.setBackground(QColor("#FDF5E6"))
+                self.table_vec.setItem(i, 3, item_q0)
+
         self.table_vec.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         layout.addWidget(self.table_vec, stretch=1)
 
@@ -1637,6 +1652,10 @@ class UltimateShipAnalyzer(QMainWindow):
             self.setup_indeterminate_equations()
             QApplication.processEvents()
 
+            progress.setLabelText("Solving Equations & Superposition...")
+            self.solve_indeterminate_and_superpose()
+            QApplication.processEvents()
+
             progress.setLabelText("Calculating Section Properties...")
             progress.setValue(99)
             QApplication.processEvents()
@@ -2444,6 +2463,72 @@ class UltimateShipAnalyzer(QMainWindow):
             f"- 유연도 행렬 [δ] : {num_cells} x {num_cells} 생성 완료\n"
             f"- 우변 벡터 {{Δ0}} : {num_cells} x 1 생성 완료\n"
         )
+
+    def solve_indeterminate_and_superpose(self):
+        """3단계 & 4단계: 연립방정식 풀이(q0 도출) 및 최종 전단흐름 합산"""
+        if getattr(self, 'matrix_delta', None) is None or len(self.matrix_delta) == 0:
+            return
+
+        try:
+            # 1. 연립방정식 풀이: [δ] {q0} = {-Δ0}
+            # 파이썬 내부 선형대수 솔버를 통해 0.01초 만에 해를 도출합니다.
+            q0_actual = np.linalg.solve(self.matrix_delta, -self.vector_delta0)
+            self.solved_q0 = q0_actual  # 결과 저장
+
+            num_cells = len(self.cells_info)
+            user_vy = getattr(self, 'user_Vy_total', 1000000.0)
+
+            # 2. 결과 텍스트 출력용 포맷팅 (로그창 출력용)
+            q0_summary = "\n\n🎯 [최종 부정정 전단흐름(q0) 해 도출 완료]\n"
+            q0_summary += "----------------------------------------\n"
+            for i in range(num_cells):
+                cid = self.cells_info[i]['cell_id']
+                val = q0_actual[i]
+                q0_summary += f" - Cell {cid:02d} 회전 전단류(q0) : {val:+,.2f} N/mm\n"
+            q0_summary += "----------------------------------------\n"
+
+            self.cell_equation_summary += q0_summary
+
+            # 3. 최종 전단흐름 합산 (Superposition)
+            calc_dirs = {}
+            if hasattr(self, 'calc_route'):
+                for route in self.calc_route:
+                    calc_dirs[route['edge_id']] = route['is_forward']
+
+            # 각 부재(Edge)마다 더해져야 할 총 q0 값을 누적할 딕셔너리
+            edge_q0_sum_actual = defaultdict(float)
+
+            for idx_i, cell_i in enumerate(self.cells_info):
+                ordered_edges = cell_i.get('ordered_edges', [])
+                ordered_nodes = cell_i.get('ordered_nodes', [])
+                q0_val = q0_actual[idx_i]
+
+                if not ordered_edges: continue
+
+                curr_n = ordered_nodes[0]
+                for eid in ordered_edges:
+                    edge_data = self.graph_edges[eid]
+                    is_ccw_fwd = (edge_data['start_node'] == curr_n)
+                    curr_n = edge_data['end_node'] if is_ccw_fwd else edge_data['start_node']
+
+                    # 🔥 방향 계수 매핑: q_b 계산 방향과 방의 회전 방향이 같으면 더하고, 다르면 뺍니다.
+                    if eid in calc_dirs:
+                        mult = 1 if is_ccw_fwd == calc_dirs[eid] else -1
+                        edge_q0_sum_actual[eid] += mult * q0_val
+
+            # 4. 기존 정정 전단류(q_b) 결과에 계산된 q_0를 단위 하중 스케일로 합산
+            for eid, chunks in self.edge_q_results.items():
+                if eid in edge_q0_sum_actual:
+                    # q_b가 단위하중당 흐름(1/mm)으로 저장되어 있으므로, q0도 Vy로 나누어 더해줌
+                    q0_unit_to_add = edge_q0_sum_actual[eid] / user_vy
+                    for chunk in chunks:
+                        chunk['q_start_unit'] += q0_unit_to_add
+                        chunk['q_end_unit'] += q0_unit_to_add
+
+        except np.linalg.LinAlgError:
+            self.cell_equation_summary += "\n\n❌ [오류] 연립방정식 행렬이 특이행렬(Singular Matrix)이어서 해를 구할 수 없습니다."
+        except Exception as e:
+            self.cell_equation_summary += f"\n\n❌ [오류] 부정정 전단류 합산 중 에러 발생: {str(e)}"
 
     def on_edge_click(self, event):
         if event.artist and hasattr(event.artist, 'get_gid'):
