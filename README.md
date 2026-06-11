@@ -230,7 +230,6 @@ class CellLoopViewerDialog(QDialog):
         ax.grid(True, linestyle=':', alpha=0.5)
         self.canvas.draw()
 
-
 class CalcRouteViewerDialog(QDialog):
     def __init__(self, main_app):
         super().__init__(main_app)
@@ -435,6 +434,109 @@ class CalcRouteViewerDialog(QDialog):
         ax.grid(True, linestyle=':', alpha=0.6)
         self.canvas.draw()
 
+
+class MatrixViewerDialog(QDialog):
+    def __init__(self, main_app):
+        super().__init__(main_app)
+        self.main_app = main_app
+        self.setWindowTitle("부정정 방정식 세팅 결과 뷰어 (Matrix & Vector)")
+        self.resize(1100, 800)
+
+        # PySide6 추가 임포트 (엑셀 형태의 테이블 위젯 렌더링용)
+        from PySide6.QtWidgets import QTableWidget, QTableWidgetItem, QHeaderView
+        from PySide6.QtGui import QColor, QBrush, QFont
+        from PySide6.QtCore import Qt
+
+        layout = QVBoxLayout(self)
+
+        info_label = QLabel(
+            "<b>[부정정 전단흐름 연립방정식: [δ]{q_0} = {-Δ_0}]</b><br>"
+            "계산되어 저장된 <b>유연도 행렬([δ])</b>과 <b>초기 비틀림 변위 적분항({Δ_0})</b>입니다.<br>"
+            "<span style='color:blue;'>파란색</span>: 대각항 (각 방의 테두리 전체 강성) | "
+            "<span style='color:red;'>빨간색</span>: 비대각항 (이웃한 방과 상쇄되는 공유 격벽의 강성)"
+        )
+        layout.addWidget(info_label)
+
+        # 데이터가 없을 경우의 안전장치
+        if not hasattr(self.main_app, 'matrix_delta') or self.main_app.matrix_delta is None or len(
+                self.main_app.matrix_delta) == 0:
+            error_label = QLabel("<b>❌ 행렬 데이터가 없습니다. 먼저 1D 변환 및 계산을 실행해주세요.</b>")
+            error_label.setStyleSheet("color: red; font-size: 14px;")
+            layout.addWidget(error_label)
+            return
+
+        num_cells = len(self.main_app.cells_info)
+        mat = self.main_app.matrix_delta
+        vec = self.main_app.vector_delta0
+
+        # --- 1. 유연도 행렬 [δ] 테이블 생성 ---
+        layout.addWidget(QLabel("<h3>✅ 1. 유연도 행렬 [δ] (Flexibility Matrix)</h3>"))
+        self.table_mat = QTableWidget(num_cells, num_cells)
+
+        headers = [f"Cell {self.main_app.cells_info[i]['cell_id']}" for i in range(num_cells)]
+        self.table_mat.setHorizontalHeaderLabels(headers)
+        self.table_mat.setVerticalHeaderLabels(headers)
+
+        font_bold = QFont()
+        font_bold.setBold(True)
+
+        for i in range(num_cells):
+            for j in range(num_cells):
+                val = mat[i, j]
+                item = QTableWidgetItem(f"{val:,.3f}")
+                item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+
+                # 대각항과 비대각항 색상 분리
+                if i == j:
+                    item.setForeground(QBrush(QColor("blue")))
+                    item.setFont(font_bold)
+                    item.setBackground(QColor("#F0F8FF"))  # 대각항 옅은 파란색 배경
+                elif val != 0:
+                    item.setForeground(QBrush(QColor("crimson")))
+                else:
+                    item.setForeground(QBrush(QColor("#BDC3C7")))
+
+                self.table_mat.setItem(i, j, item)
+
+        # 글자 길이에 맞춰 셀 너비 자동 조절
+        self.table_mat.resizeColumnsToContents()
+        layout.addWidget(self.table_mat, stretch=2)
+
+        # --- 2. 우변 벡터 {-Δ_0} 테이블 생성 ---
+        layout.addWidget(QLabel("<h3>✅ 2. 우변 벡터 {-Δ_0} (Initial Twist Term)</h3>"))
+        self.table_vec = QTableWidget(num_cells, 3)
+        self.table_vec.setHorizontalHeaderLabels(["Cell ID", "초기 비틀림 적분 (Δ_i0)", "우변 방정식 적용 (-Δ_i0)"])
+        self.table_vec.verticalHeader().setVisible(False)  # 왼쪽 기본 인덱스 숨김
+
+        for i in range(num_cells):
+            cid = self.main_app.cells_info[i]['cell_id']
+            val = vec[i]
+
+            # Cell ID 컬럼
+            item_id = QTableWidgetItem(f"Cell {cid}")
+            item_id.setTextAlignment(Qt.AlignCenter)
+            item_id.setFont(font_bold)
+            item_id.setBackground(QColor("#ECEFF1"))
+            self.table_vec.setItem(i, 0, item_id)
+
+            # Δ_i0 (원래 값)
+            item_val1 = QTableWidgetItem(f"{val:,.2f}")
+            item_val1.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            self.table_vec.setItem(i, 1, item_val1)
+
+            # -Δ_i0 (부호 뒤집힌 최종 적용 값)
+            item_val2 = QTableWidgetItem(f"{-val:,.2f}")
+            item_val2.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            item_val2.setFont(font_bold)
+            color = "crimson" if -val < 0 else "dodgerblue"
+            item_val2.setForeground(QBrush(QColor(color)))
+            self.table_vec.setItem(i, 2, item_val2)
+
+        # 벡터 테이블은 창 너비에 맞춰 꽉 차게 조절
+        self.table_vec.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        layout.addWidget(self.table_vec, stretch=1)
+
+
 class UltimateShipAnalyzer(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -541,6 +643,13 @@ class UltimateShipAnalyzer(QMainWindow):
         self.btn_view_route.setObjectName("btnGreen")
         self.btn_view_route.clicked.connect(self.show_calc_route)
         control_panel_layout.addWidget(self.btn_view_route)
+
+        self.btn_view_matrix = QPushButton("5. 부정정 행렬 세팅 확인 🧮")
+        self.btn_view_matrix.setFixedHeight(40)
+        self.btn_view_matrix.setObjectName("btnGreen")
+        self.btn_view_matrix.setEnabled(False)
+        self.btn_view_matrix.clicked.connect(self.show_matrix_viewer)
+        control_panel_layout.addWidget(self.btn_view_matrix)
 
         control_panel_layout.addStretch()
         main_layout.addWidget(control_panel)
@@ -1524,6 +1633,10 @@ class UltimateShipAnalyzer(QMainWindow):
             self.calculate_determinate_shear_flow(Vy_total=Vy_input_N)
             QApplication.processEvents()
 
+            progress.setLabelText("Setting up Indeterminate Equations...")
+            self.setup_indeterminate_equations()
+            QApplication.processEvents()
+
             progress.setLabelText("Calculating Section Properties...")
             progress.setValue(99)
             QApplication.processEvents()
@@ -1606,6 +1719,7 @@ class UltimateShipAnalyzer(QMainWindow):
                 f"{calc_result_text}"
                 f"{self.graph_summary}"
                 f"{getattr(self, 'cell_summary', '')}"
+                f"{getattr(self, 'cell_equation_summary', '')}" 
                 f"{shear_ixx_text}"
             )
             self.result_box.setText(summary_text)
@@ -1622,6 +1736,7 @@ class UltimateShipAnalyzer(QMainWindow):
             self.btn_calc.setEnabled(True)
             self.btn_load.setEnabled(True)
             self.btn_view_loops.setEnabled(True)
+            self.btn_view_matrix.setEnabled(True)
 
     def build_graph(self):
         from collections import defaultdict
@@ -2234,6 +2349,102 @@ class UltimateShipAnalyzer(QMainWindow):
 
         self.user_Vy_total = Vy_total
 
+    def setup_indeterminate_equations(self):
+        """1단계 & 2단계: 유연도 행렬 [δ]과 초기 비틀림 벡터 {Δ0} 계산 및 저장"""
+        num_cells = len(self.cells_info) if hasattr(self, 'cells_info') else 0
+        if num_cells == 0:
+            self.matrix_delta = np.array([])
+            self.vector_delta0 = np.array([])
+            self.cell_equation_summary = "\n\n❌ 폐단면(Cell)이 존재하지 않아 행렬을 구성할 수 없습니다."
+            return
+
+        delta_matrix = np.zeros((num_cells, num_cells))
+        delta0_vector = np.zeros(num_cells)
+
+        calc_dirs = {}
+        if hasattr(self, 'calc_route'):
+            for route in self.calc_route:
+                calc_dirs[route['edge_id']] = route['is_forward']
+
+        user_vy = getattr(self, 'user_Vy_total', 1000000.0)
+
+        # 각 셀(Cell)을 순회하며 방정식의 계수 세팅
+        for idx_i, cell_i in enumerate(self.cells_info):
+            delta_i0 = 0.0
+            delta_ii = 0.0
+
+            ordered_edges = cell_i.get('ordered_edges', [])
+            ordered_nodes = cell_i.get('ordered_nodes', [])
+
+            # CCW 방향 매핑 (1, -1 방향 계수 판별용)
+            cell_ccw_dirs = {}
+            if ordered_edges:
+                curr_n = ordered_nodes[0]
+                for eid in ordered_edges:
+                    edge_data = self.graph_edges[eid]
+                    if edge_data['start_node'] == curr_n:
+                        cell_ccw_dirs[eid] = True
+                        curr_n = edge_data['end_node']
+                    else:
+                        cell_ccw_dirs[eid] = False
+                        curr_n = edge_data['start_node']
+
+            for eid in ordered_edges:
+                edge_data = self.graph_edges[eid]
+                thk = edge_data.get('thickness', 10.0)
+                if thk < 0.1: thk = 0.1  # ZeroDivision 방지
+                length = edge_data['geometry'].length
+
+                # 2단계: [δ_ii] 대각항 누적 (ds / t)
+                delta_ii += length / thk
+
+                # 1단계: [Δ_i0] 우변 벡터 누적 (q_b / t * ds)
+                if eid in self.edge_q_results and eid in calc_dirs:
+                    mult = 1 if cell_ccw_dirs[eid] == calc_dirs[eid] else -1
+
+                    edge_qb_integral = 0.0
+                    for chunk in self.edge_q_results[eid]:
+                        chunk_len = chunk['geom'].length
+                        qs = chunk['q_start_unit'] * user_vy
+                        qe = chunk['q_end_unit'] * user_vy
+
+                        # 사다리꼴 적분법(Trapezoidal rule) 적용
+                        q_avg = (qs + qe) / 2.0
+                        edge_qb_integral += (q_avg / thk) * chunk_len
+
+                    delta_i0 += mult * edge_qb_integral
+
+            delta_matrix[idx_i, idx_i] = delta_ii
+            delta0_vector[idx_i] = delta_i0
+
+            # 2단계: [δ_ij] 비대각항 (공유 격벽) 세팅
+            for idx_j in range(idx_i + 1, num_cells):
+                cell_j = self.cells_info[idx_j]
+                shared_edges = set(ordered_edges).intersection(set(cell_j.get('ordered_edges', [])))
+
+                delta_ij = 0.0
+                for eid in shared_edges:
+                    edge_data = self.graph_edges[eid]
+                    thk = edge_data.get('thickness', 10.0)
+                    if thk < 0.1: thk = 0.1
+                    length = edge_data['geometry'].length
+
+                    # CCW 기준으로 공유 격벽의 회전 방향은 항상 반대이므로 무조건 빼기(-)
+                    delta_ij -= length / thk
+
+                delta_matrix[idx_i, idx_j] = delta_ij
+                delta_matrix[idx_j, idx_i] = delta_ij  # 대칭 행렬 특성 적용
+
+        # 계산된 데이터를 인스턴스 변수에 영구 저장 (다음 단계에 사용)
+        self.matrix_delta = delta_matrix
+        self.vector_delta0 = delta0_vector
+
+        self.cell_equation_summary = (
+            f"\n\n🧩 [부정정 방정식 세팅 완료]\n"
+            f"- 유연도 행렬 [δ] : {num_cells} x {num_cells} 생성 완료\n"
+            f"- 우변 벡터 {{Δ0}} : {num_cells} x 1 생성 완료\n"
+        )
+
     def on_edge_click(self, event):
         if event.artist and hasattr(event.artist, 'get_gid'):
             gid = event.artist.get_gid()
@@ -2501,6 +2712,12 @@ class UltimateShipAnalyzer(QMainWindow):
         self.route_dialog = CalcRouteViewerDialog(self)
         self.route_dialog.setWindowModality(Qt.NonModal)
         self.route_dialog.show()
+
+    def show_matrix_viewer(self):
+        """행렬 데이터 확인 팝업창 띄우기"""
+        self.matrix_dialog = MatrixViewerDialog(self)
+        self.matrix_dialog.setWindowModality(Qt.NonModal)
+        self.matrix_dialog.show()
 
 
 if __name__ == "__main__":
