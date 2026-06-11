@@ -1694,7 +1694,7 @@ class UltimateShipAnalyzer(QMainWindow):
                                                 'is_forward': is_forward})
 
                         L_total = geom.length
-                        num_chunks = max(1, int(np.ceil(L_total / 300.0)))
+                        num_chunks = max(1, int(np.ceil(L_total / 50.0)))
                         sub_results = []
                         unprocessed_mps = self.graph_edges[m].get('mass_points', []).copy()
 
@@ -1778,7 +1778,7 @@ class UltimateShipAnalyzer(QMainWindow):
                                      'is_forward': is_forward})
 
                                 L_total = geom.length
-                                num_chunks = max(1, int(np.ceil(L_total / 300.0)))
+                                num_chunks = max(1, int(np.ceil(L_total / 50.0)))
                                 sub_results = []
                                 unprocessed_mps = self.graph_edges[m].get('mass_points', []).copy()
 
