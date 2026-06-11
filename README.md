@@ -112,6 +112,95 @@ class SlitViewerDialog(QDialog):
         self.canvas.draw()
 
 
+class CellLoopViewerDialog(QDialog):
+    def __init__(self, main_app):
+        super().__init__(main_app)
+        self.main_app = main_app
+        self.setWindowTitle("Cell CCW Loop Viewer (반시계 방향 순환 검증)")
+        self.resize(800, 800)
+
+        layout = QVBoxLayout(self)
+
+        info_label = QLabel(
+            "<b>[다중 폐단면 셀(Cell) 반시계 방향 순환 경로 검증]</b><br>"
+            "각 방(Cell)을 구성하는 부재들이 <b>반시계 방향(CCW)</b>으로 올바르게 꼬리를 물고 있는지 화살표로 확인합니다."
+        )
+        layout.addWidget(info_label)
+
+        self.fig = Figure()
+        self.canvas = FigureCanvas(self.fig)
+        layout.addWidget(NavigationToolbar(self.canvas, self))
+        layout.addWidget(self.canvas)
+
+        self.plot_loops()
+
+    def plot_loops(self):
+        ax = self.fig.add_subplot(111)
+
+        # 1. 배경: 전체 형상을 옅은 회색으로 렌더링
+        for e in self.main_app.graph_edges:
+            geom = e['geometry']
+            ax.plot(*geom.xy, color='#EEEEEE', linewidth=1, zorder=1)
+
+        import matplotlib.cm as cm
+        cmap = cm.get_cmap('tab10')
+
+        # 2. 실제 곡선 경로(Geometry)를 살려서 렌더링
+        for idx, cinfo in enumerate(self.main_app.cells_info):
+            color = cmap(idx % 10)
+            ordered_nodes = cinfo.get('ordered_nodes', [])
+            ordered_edges = cinfo.get('ordered_edges', [])
+
+            if not ordered_edges: continue
+
+            curr_n = ordered_nodes[0]
+
+            for eid in ordered_edges:
+                edge_data = self.main_app.graph_edges[eid]
+                geom_coords = np.array(edge_data['geometry'].coords)
+
+                # 노드 진행 방향에 맞춰 곡선 좌표계 정렬
+                if edge_data['start_node'] == curr_n:
+                    path_coords = geom_coords
+                    curr_n = edge_data['end_node']
+                else:
+                    path_coords = geom_coords[::-1]
+                    curr_n = edge_data['start_node']
+
+                # 실제 곡선 렌더링
+                ax.plot(path_coords[:, 0], path_coords[:, 1], color=color, linewidth=2.5, alpha=0.6, zorder=4)
+
+                # 곡선의 중간 지점(50%)에서 탄젠트 방향으로 화살표 생성
+                from shapely.geometry import LineString
+                geom_line = LineString(path_coords)
+
+                if geom_line.length > 10.0:
+                    pt_mid = geom_line.interpolate(0.5, normalized=True)
+                    pt_next = geom_line.interpolate(0.51, normalized=True)  # 살짝 앞쪽 포인트를 잡아 방향 벡터 추출
+
+                    vec = np.array([pt_next.x - pt_mid.x, pt_next.y - pt_mid.y])
+                    length = np.linalg.norm(vec)
+
+                    if length > 1e-6:
+                        arrow_len = min(geom_line.length * 0.3, 150.0)
+                        dv = vec / length * arrow_len
+
+                        ax.annotate('', xy=(pt_mid.x + dv[0], pt_mid.y + dv[1]),
+                                    xytext=(pt_mid.x, pt_mid.y),
+                                    arrowprops=dict(arrowstyle="->", color=color, lw=3.0, shrinkA=0, shrinkB=0),
+                                    zorder=5)
+
+            # 셀 중앙에 번호 라벨 표시
+            cx, cy = cinfo['polygon'].centroid.x, cinfo['polygon'].centroid.y
+            ax.annotate(f"Cell {cinfo['cell_id']}", (cx, cy), color='white', weight='bold',
+                        ha='center', va='center', zorder=10,
+                        bbox=dict(boxstyle="circle,pad=0.3", fc=color, ec="none", alpha=0.9))
+
+        ax.set_aspect('equal')
+        ax.grid(True, linestyle=':', alpha=0.6)
+        self.canvas.draw()
+
+
 class UltimateShipAnalyzer(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -204,6 +293,13 @@ class UltimateShipAnalyzer(QMainWindow):
         self.btn_calc.setObjectName("btnGreen")
         self.btn_calc.clicked.connect(self.process_1d_geometry)
         control_panel_layout.addWidget(self.btn_calc)
+
+        self.btn_view_loops = QPushButton("3. 셀 순환 경로 확인 🔄")
+        self.btn_view_loops.setFixedHeight(40)
+        self.btn_view_loops.setObjectName("btnGreen")
+        self.btn_view_loops.setEnabled(False)  # 계산 완료 후 활성화
+        self.btn_view_loops.clicked.connect(self.show_cell_loops)
+        control_panel_layout.addWidget(self.btn_view_loops)
 
         control_panel_layout.addStretch()
         main_layout.addWidget(control_panel)
@@ -1284,6 +1380,7 @@ class UltimateShipAnalyzer(QMainWindow):
             self.is_processing = False
             self.btn_calc.setEnabled(True)
             self.btn_load.setEnabled(True)
+            self.btn_view_loops.setEnabled(True)
 
     def build_graph(self):
         from collections import defaultdict
@@ -1413,12 +1510,16 @@ class UltimateShipAnalyzer(QMainWindow):
         )
 
     def detect_closed_cells(self):
+        from shapely.ops import polygonize, unary_union
+        from shapely.geometry import LinearRing
+        from collections import defaultdict
+        import numpy as np
+
         self.cells_info = []
         self.edge_to_cells = {e['id']: [] for e in self.graph_edges}
 
         lines = [e['geometry'] for e in self.graph_edges]
         merged_lines = unary_union(lines)
-
         polygons = list(polygonize(merged_lines))
 
         for i, poly in enumerate(polygons):
@@ -1429,13 +1530,77 @@ class UltimateShipAnalyzer(QMainWindow):
             bound = poly.boundary
             for eid, e in enumerate(self.graph_edges):
                 geom = e['geometry']
-                if bound.distance(geom.centroid) < 1e-2:
+                # 곡선의 오차 방지를 위해 정중앙점(interpolate 0.5)을 사용해 엣지 포함 여부 엄격 판별
+                pt_on_line = geom.interpolate(0.5, normalized=True)
+                if bound.distance(pt_on_line) < 1e-2:
                     cell_edges.append(eid)
                     self.edge_to_cells[eid].append(cell_id)
 
             self.cells_info.append({
-                'cell_id': cell_id, 'polygon': poly, 'area': cell_area, 'edges': cell_edges
+                'cell_id': cell_id,
+                'polygon': poly,
+                'area': cell_area,
+                'edges': cell_edges
             })
+
+        # ✨ 각 셀의 실제 곡선 경로 전체 좌표계를 조립하여 반시계(CCW) 판별
+        for cinfo in self.cells_info:
+            cell_edges = cinfo['edges']
+            if not cell_edges: continue
+
+            adj = defaultdict(list)
+            for eid in cell_edges:
+                e = self.graph_edges[eid]
+                adj[e['start_node']].append((e['end_node'], eid))
+                adj[e['end_node']].append((e['start_node'], eid))
+
+            start_node = list(adj.keys())[0]
+            curr_node = start_node
+            ordered_nodes = [curr_node]
+            ordered_edges = []
+            visited_edges = set()
+
+            # 한붓그리기 경로 추적
+            while len(visited_edges) < len(cell_edges):
+                moved = False
+                for nxt, eid in adj[curr_node]:
+                    if eid not in visited_edges:
+                        visited_edges.add(eid)
+                        ordered_edges.append(eid)
+                        curr_node = nxt
+                        ordered_nodes.append(curr_node)
+                        moved = True
+                        break
+                if not moved: break
+
+            # ✨ [핵심 교체] 직선 노드가 아닌 곡선 전체를 하나의 링(Ring)으로 조립
+            full_path_coords = []
+            curr_n = start_node
+
+            for eid in ordered_edges:
+                edge_data = self.graph_edges[eid]
+                geom_coords = list(edge_data['geometry'].coords)
+
+                if edge_data['start_node'] == curr_n:
+                    full_path_coords.extend(geom_coords[:-1])
+                    curr_n = edge_data['end_node']
+                else:
+                    full_path_coords.extend(geom_coords[::-1][:-1])
+                    curr_n = edge_data['start_node']
+
+            # 루프 닫기
+            full_path_coords.append(full_path_coords[0])
+
+            # Shapely의 내부 연산을 통해 완벽하게 정밀한 곡선 기반 방향성 도출
+            ring = LinearRing(full_path_coords)
+
+            # 만약 시계방향(CW)이라면 배열의 순서를 완전히 뒤집어 반시계(CCW)로 교정
+            if not ring.is_ccw:
+                ordered_nodes.reverse()
+                ordered_edges.reverse()
+
+            cinfo['ordered_nodes'] = ordered_nodes
+            cinfo['ordered_edges'] = ordered_edges
 
     def execute_flowchart_algorithm(self):
         sim_edges = {e['id']: {'u': e['start_node'], 'v': e['end_node']} for e in self.graph_edges}
@@ -2076,6 +2241,11 @@ class UltimateShipAnalyzer(QMainWindow):
 
         self.can1.draw()
         self.can2.draw()
+
+    def show_cell_loops(self):
+        """셀 순환 검증 팝업창을 띄웁니다."""
+        dialog = CellLoopViewerDialog(self)
+        dialog.exec()
 
 
 if __name__ == "__main__":
