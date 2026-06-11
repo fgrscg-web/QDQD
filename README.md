@@ -116,14 +116,16 @@ class CellLoopViewerDialog(QDialog):
     def __init__(self, main_app):
         super().__init__(main_app)
         self.main_app = main_app
-        self.setWindowTitle("Cell CCW Loop Viewer (반시계 방향 순환 검증)")
-        self.resize(800, 800)
+        self.setWindowTitle("다중 폐단면 방향성(Sign Multiplier) 일괄 매핑 검증")
+        self.resize(1100, 900)
 
         layout = QVBoxLayout(self)
 
         info_label = QLabel(
-            "<b>[다중 폐단면 셀(Cell) 반시계 방향 순환 경로 검증]</b><br>"
-            "각 방(Cell)을 구성하는 부재들이 <b>반시계 방향(CCW)</b>으로 올바르게 꼬리를 물고 있는지 화살표로 확인합니다."
+            "<b>[다중 폐단면 셀(Cell) 방향 계수 일괄 검증]</b><br>"
+            "모든 셀의 <b>반시계(CCW) 경로</b>와 정정 전단류($q_b$) <b>계산 경로</b>를 대조한 결과가 한 번에 출력됩니다.<br>"
+            "각 숫자는 해당 셀의 내부 방향으로 자동 오프셋되어 표시되므로 공유 격벽의 부호 분배를 한눈에 확인할 수 있습니다.<br>"
+            "<span style='color:blue;'><b>+1</b></span>: 방향 일치 | <span style='color:red;'><b>-1</b></span>: 방향 반대 (충돌) | 표시되지 않은 외판선: 0"
         )
         layout.addWidget(info_label)
 
@@ -135,71 +137,188 @@ class CellLoopViewerDialog(QDialog):
         self.plot_loops()
 
     def plot_loops(self):
+        self.fig.clear()
         ax = self.fig.add_subplot(111)
 
-        # 1. 배경: 전체 형상을 옅은 회색으로 렌더링
+        # 1. 배경: 전체 에지를 아주 옅은 회색으로 기본 배치
         for e in self.main_app.graph_edges:
             geom = e['geometry']
-            ax.plot(*geom.xy, color='#EEEEEE', linewidth=1, zorder=1)
+            ax.plot(*geom.xy, color='#E5E7EB', linewidth=1.2, zorder=1)
+
+        # 정정 전단류 계산 경로 데이터 맵 구축
+        calc_dirs = {}
+        if hasattr(self.main_app, 'calc_route'):
+            for route in self.main_app.calc_route:
+                calc_dirs[route['edge_id']] = route['is_forward']
+
+        # 전체 단면의 가로세로 치수 기준 스케일 계산 (텍스트 오프셋 양 조절용)
+        nodes_arr = np.array(list(self.main_app.graph_nodes.values()))
+        max_dim = max(nodes_arr[:, 0].max() - nodes_arr[:, 0].min(),
+                      nodes_arr[:, 1].max() - nodes_arr[:, 1].min()) if len(nodes_arr) > 0 else 10000.0
 
         import matplotlib.cm as cm
         cmap = cm.get_cmap('tab10')
 
-        # 2. 실제 곡선 경로(Geometry)를 살려서 렌더링
+        # 2. 모든 셀을 순회하며 방향 계수를 내부 방향으로 밀어 넣어 일괄 렌더링
         for idx, cinfo in enumerate(self.main_app.cells_info):
             color = cmap(idx % 10)
-            ordered_nodes = cinfo.get('ordered_nodes', [])
             ordered_edges = cinfo.get('ordered_edges', [])
+            ordered_nodes = cinfo.get('ordered_nodes', [])
 
             if not ordered_edges: continue
 
+            # 이 셀의 고유 반시계 방향 정보 추출
+            cell_ccw_dirs = {}
             curr_n = ordered_nodes[0]
-
             for eid in ordered_edges:
                 edge_data = self.main_app.graph_edges[eid]
-                geom_coords = np.array(edge_data['geometry'].coords)
-
-                # 노드 진행 방향에 맞춰 곡선 좌표계 정렬
                 if edge_data['start_node'] == curr_n:
-                    path_coords = geom_coords
+                    cell_ccw_dirs[eid] = True
                     curr_n = edge_data['end_node']
                 else:
-                    path_coords = geom_coords[::-1]
+                    cell_ccw_dirs[eid] = False
                     curr_n = edge_data['start_node']
 
-                # 실제 곡선 렌더링
-                ax.plot(path_coords[:, 0], path_coords[:, 1], color=color, linewidth=2.5, alpha=0.6, zorder=4)
+            # 에지별 부호 판별 및 그래픽 처리
+            for eid in ordered_edges:
+                edge_data = self.main_app.graph_edges[eid]
+                geom = edge_data['geometry']
 
-                # 곡선의 중간 지점(50%)에서 탄젠트 방향으로 화살표 생성
-                from shapely.geometry import LineString
-                geom_line = LineString(path_coords)
+                if edge_data.get('type') == 'stiffener':
+                    continue
 
-                if geom_line.length > 10.0:
-                    pt_mid = geom_line.interpolate(0.5, normalized=True)
-                    pt_next = geom_line.interpolate(0.51, normalized=True)  # 살짝 앞쪽 포인트를 잡아 방향 벡터 추출
+                if eid in cell_ccw_dirs and eid in calc_dirs:
+                    mult = 1 if cell_ccw_dirs[eid] == calc_dirs[eid] else -1
+                else:
+                    mult = 0
 
-                    vec = np.array([pt_next.x - pt_mid.x, pt_next.y - pt_mid.y])
-                    length = np.linalg.norm(vec)
+                if mult == 0: continue  # 관련 없는 부재는 통과
 
-                    if length > 1e-6:
-                        arrow_len = min(geom_line.length * 0.3, 150.0)
-                        dv = vec / length * arrow_len
+                # 셀 고유 색상으로 기하학 테두리 강조
+                coords = np.array(geom.coords)
+                ax.plot(coords[:, 0], coords[:, 1], color=color, linewidth=2.5, alpha=0.6, zorder=4)
 
-                        ax.annotate('', xy=(pt_mid.x + dv[0], pt_mid.y + dv[1]),
-                                    xytext=(pt_mid.x, pt_mid.y),
-                                    arrowprops=dict(arrowstyle="->", color=color, lw=3.0, shrinkA=0, shrinkB=0),
-                                    zorder=5)
+                # 중요: 선분 중간점에서 셀의 안쪽 도심(Centroid)을 향하는 방향 벡터 계산
+                pt_mid = geom.interpolate(0.5, normalized=True)
+                pt_centroid = cinfo['polygon'].centroid
 
-            # 셀 중앙에 번호 라벨 표시
+                vec_to_centroid = np.array([pt_centroid.x - pt_mid.x, pt_centroid.y - pt_mid.y])
+                vec_len = np.linalg.norm(vec_to_centroid)
+
+                if vec_len > 1e-6:
+                    # 도면 크기에 비례하여 적절한 가독성 거리를 띄움 (겹침 현상 원천 배제)
+                    offset_dist = min(vec_len * 0.2, max_dim * 0.03)
+                    v_norm = vec_to_centroid / vec_len
+                    text_x = pt_mid.x + v_norm[0] * offset_dist
+                    text_y = pt_mid.y + v_norm[1] * offset_dist
+                else:
+                    text_x, text_y = pt_mid.x, pt_mid.y
+
+                # 부호 매핑 배지 그리기 (+1은 파랑, -1은 빨강)
+                bg_color = 'dodgerblue' if mult == 1 else 'crimson'
+                ax.annotate(f"{mult:+d}", (text_x, text_y), color='white', weight='bold',
+                            fontsize=9, ha='center', va='center', zorder=6,
+                            bbox=dict(boxstyle="round,pad=0.15", fc=bg_color, ec='none', alpha=0.85))
+
+            # 셀 중앙 번호 라벨링
             cx, cy = cinfo['polygon'].centroid.x, cinfo['polygon'].centroid.y
-            ax.annotate(f"Cell {cinfo['cell_id']}", (cx, cy), color='white', weight='bold',
-                        ha='center', va='center', zorder=10,
-                        bbox=dict(boxstyle="circle,pad=0.3", fc=color, ec="none", alpha=0.9))
+            ax.annotate(f"Cell {cinfo['cell_id']}", (cx, cy), color='black', weight='bold',
+                        fontsize=11, ha='center', va='center', zorder=10,
+                        bbox=dict(boxstyle="round,pad=0.2", fc='white', ec=color, alpha=0.9, lw=2))
+
+        ax.set_aspect('equal')
+        ax.grid(True, linestyle=':', alpha=0.5)
+        self.canvas.draw()
+
+
+class CalcRouteViewerDialog(QDialog):
+    def __init__(self, main_app):
+        super().__init__(main_app)
+        self.main_app = main_app
+        self.setWindowTitle("전단류 계산 경로(Calc Route) 뷰어")
+        self.resize(1000, 800)
+
+        layout = QVBoxLayout(self)
+
+        info_label = QLabel(
+            "<b>[정정 전단류($q_b$) 탐색 경로 및 방향 확인]</b><br>"
+            "<span style='color:green;'><b>Phase 1 (초록색)</b></span>: 자유단(Free end)에서 시작한 기본 탐색 경로 | "
+            "<span style='color:orange;'><b>Phase 2 (주황색)</b></span>: 폐단면 내부를 강제로 가르는 브릿지 탐색 경로<br>"
+            "화살표 방향이 프로그램이 전단류를 누적하며 나아간 실제 <b>계산 방향(from → to)</b>이며, 검은색 원 안의 숫자는 <b>탐색 순서</b>입니다."
+        )
+        layout.addWidget(info_label)
+
+        self.fig = Figure()
+        self.canvas = FigureCanvas(self.fig)
+        layout.addWidget(NavigationToolbar(self.canvas, self))
+        layout.addWidget(self.canvas)
+
+        self.plot_route()
+
+    def plot_route(self):
+        self.fig.clear()
+        ax = self.fig.add_subplot(111)
+
+        # 1. 배경: 전체 에지를 옅은 회색으로 렌더링
+        for e in self.main_app.graph_edges:
+            geom = e['geometry']
+            ax.plot(*geom.xy, color='#EEEEEE', linewidth=1, zorder=1)
+
+        if not hasattr(self.main_app, 'calc_route') or not self.main_app.calc_route:
+            ax.text(0.5, 0.5, "계산 경로 데이터가 없습니다.\n먼저 1D 변환 및 정렬을 실행해주세요.",
+                    ha='center', va='center', transform=ax.transAxes, fontsize=12, weight='bold')
+            self.canvas.draw()
+            return
+
+        # 2. 계산 경로(calc_route) 순회하며 렌더링
+        for i, route in enumerate(self.main_app.calc_route):
+            eid = route['edge_id']
+            phase = route.get('phase', 1)
+
+            edge_data = self.main_app.graph_edges[eid]
+            geom_coords = np.array(edge_data['geometry'].coords)
+
+            # 계산이 진행된 방향(from_node -> to_node)에 맞춰 기하학 좌표계 정렬
+            if route['from_node'] == edge_data['start_node']:
+                path_coords = geom_coords
+            else:
+                path_coords = geom_coords[::-1]
+
+            # Phase에 따른 색상 분리
+            color = 'limegreen' if phase == 1 else 'darkorange'
+
+            # 경로 선 그리기
+            ax.plot(path_coords[:, 0], path_coords[:, 1], color=color, linewidth=3.0, alpha=0.7, zorder=4)
+
+            # 곡선의 중간 지점 부근에서 방향 화살표 추출
+            from shapely.geometry import LineString
+            geom_line = LineString(path_coords)
+
+            if geom_line.length > 5.0:
+                pt_mid = geom_line.interpolate(0.5, normalized=True)
+                pt_next = geom_line.interpolate(0.55, normalized=True)  # 살짝 앞쪽을 향하는 벡터 추출
+
+                vec = np.array([pt_next.x - pt_mid.x, pt_next.y - pt_mid.y])
+                length = np.linalg.norm(vec)
+
+                if length > 1e-6:
+                    arrow_len = min(geom_line.length * 0.3, 100.0)
+                    dv = vec / length * arrow_len
+
+                    # 화살표 렌더링
+                    ax.annotate('', xy=(pt_mid.x + dv[0], pt_mid.y + dv[1]),
+                                xytext=(pt_mid.x, pt_mid.y),
+                                arrowprops=dict(arrowstyle="->", color=color, lw=3.0, shrinkA=0, shrinkB=0),
+                                zorder=5)
+
+                    # 탐색 순서(Index)를 검은색 동그라미로 표시 (디버깅 용도)
+                    ax.annotate(str(i + 1), (pt_mid.x, pt_mid.y), color='white', weight='bold', fontsize=3,
+                                ha='center', va='center', zorder=6,
+                                bbox=dict(boxstyle="round,pad=0.1", fc='black', ec='none', alpha=0.8))
 
         ax.set_aspect('equal')
         ax.grid(True, linestyle=':', alpha=0.6)
         self.canvas.draw()
-
 
 class UltimateShipAnalyzer(QMainWindow):
     def __init__(self):
@@ -300,6 +419,13 @@ class UltimateShipAnalyzer(QMainWindow):
         self.btn_view_loops.setEnabled(False)  # 계산 완료 후 활성화
         self.btn_view_loops.clicked.connect(self.show_cell_loops)
         control_panel_layout.addWidget(self.btn_view_loops)
+
+        # ✨ 여기에 4번 버튼 코드 추가!
+        self.btn_view_route = QPushButton("4. 전단류 계산 경로 확인 ➡️")
+        self.btn_view_route.setFixedHeight(40)
+        self.btn_view_route.setObjectName("btnGreen")
+        self.btn_view_route.clicked.connect(self.show_calc_route)
+        control_panel_layout.addWidget(self.btn_view_route)
 
         control_panel_layout.addStretch()
         main_layout.addWidget(control_panel)
@@ -2038,12 +2164,16 @@ class UltimateShipAnalyzer(QMainWindow):
                 QMessageBox.information(self, f"Edge ID: {edge_id}", info_text)
 
     def on_slit_node_click(self, event):
+        """슬릿 노드 클릭 시 위상 팝업창을 띄우는 이벤트 핸들러 (모델리스 방식)"""
         if event.artist and hasattr(event.artist, 'get_gid'):
             gid = event.artist.get_gid()
             if gid is not None and str(gid).startswith("slit_"):
                 nid = int(str(gid).split("_")[1])
-                dialog = SlitViewerDialog(self, nid)
-                dialog.exec()
+
+                # 인스턴스 변수에 바인딩하여 백그라운드 소멸 방지 및 NonModal 설정
+                self.slit_dialog = SlitViewerDialog(self, nid)
+                self.slit_dialog.setWindowModality(Qt.NonModal)
+                self.slit_dialog.show()
 
     def refresh_ui(self):
         if hasattr(self, 'cbar') and self.cbar is not None:
@@ -2243,9 +2373,16 @@ class UltimateShipAnalyzer(QMainWindow):
         self.can2.draw()
 
     def show_cell_loops(self):
-        """셀 순환 검증 팝업창을 띄웁니다."""
-        dialog = CellLoopViewerDialog(self)
-        dialog.exec()
+        """셀 순환 검증 팝업창을 띄웁니다 (모델리스 방식)"""
+        self.loop_dialog = CellLoopViewerDialog(self)
+        self.loop_dialog.setWindowModality(Qt.NonModal)
+        self.loop_dialog.show()
+
+    def show_calc_route(self):
+        """계산 경로 검증 팝업창을 띄웁니다 (모델리스 방식)"""
+        self.route_dialog = CalcRouteViewerDialog(self)
+        self.route_dialog.setWindowModality(Qt.NonModal)
+        self.route_dialog.show()
 
 
 if __name__ == "__main__":
