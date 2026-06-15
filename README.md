@@ -9,8 +9,10 @@ import pandas as pd
 import ezdxf
 import matplotlib
 import matplotlib.pyplot as plt
+import pdfplumber
 import re
 
+import progress
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas, \
     NavigationToolbar2QT as NavigationToolbar
 from matplotlib.figure import Figure
@@ -19,18 +21,535 @@ from matplotlib.ticker import FuncFormatter
 
 from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                                QPushButton, QLabel, QTextEdit, QFileDialog, QLineEdit,
-                               QHBoxLayout, QScrollArea, QFrame, QSplitter, QMessageBox, QProgressDialog)
-from PySide6.QtGui import QIcon
+                               QHBoxLayout, QScrollArea, QFrame, QSplitter, QComboBox,
+                               QInputDialog, QMessageBox, QProgressDialog, QRadioButton, QDialog)
+from PySide6.QtGui import QTextCursor, QIcon
 from PySide6.QtCore import Qt
 
 from shapely.geometry import LineString, Polygon, Point, box
 from shapely.ops import unary_union, polygonize, split, nearest_points, snap, substring
 import shapely.affinity as affinity
-from collections import defaultdict
+from shapely.strtree import STRtree
+from collections import defaultdict, deque
 
 matplotlib.use('QtAgg')
 rcParams['font.family'] = 'Malgun Gothic'
 rcParams['axes.unicode_minus'] = False
+
+
+class SlitViewerDialog(QDialog):
+    def __init__(self, main_app, slit_nid):
+        super().__init__(main_app)
+        self.main_app = main_app
+        self.slit_nid = slit_nid
+        self.setWindowTitle(f"Slit Node {slit_nid} - Topology Inspector")
+        self.resize(700, 600)
+
+        layout = QVBoxLayout(self)
+
+        info_label = QLabel(
+            f"<b>Node {slit_nid} (Slit Position)</b><br>"
+            f"<span style='color:blue;'>실선(파란색)</span>: 현재 연결이 유지된 경로<br>"
+            f"<span style='color:red;'>점선(빨간색)</span>: 루프 탐지로 인해 절단된(Cut) 경로"
+        )
+        layout.addWidget(info_label)
+
+        self.fig = Figure()
+        self.canvas = FigureCanvas(self.fig)
+        layout.addWidget(NavigationToolbar(self.canvas, self))
+        layout.addWidget(self.canvas)
+
+        self.plot_topology()
+
+    def plot_topology(self):
+        ax = self.fig.add_subplot(111)
+        all_edges = self.main_app.graph_edges
+
+        connected_nodes = set()
+        dummy_nodes = set()
+
+        for eid, e in self.main_app.remaining_edges_info.items():
+            if e['u'] == self.slit_nid or e['v'] == self.slit_nid:
+                geom = all_edges[eid]['geometry']
+                ax.plot(*geom.xy, color='blue', linewidth=3, alpha=0.8, label='Connected (연결됨)')
+
+                adj_nid = e['v'] if e['u'] == self.slit_nid else e['u']
+                connected_nodes.add(adj_nid)
+
+        for cut_info in self.main_app.cut_edges_info:
+            if cut_info['original_nid'] == self.slit_nid:
+                eid = cut_info['edge_id']
+                geom = all_edges[eid]['geometry']
+                ax.plot(*geom.xy, color='red', linewidth=3, linestyle='--', alpha=0.8, label='Cut (분리됨)')
+                dummy_nodes.add(cut_info['dummy_nid'])
+
+        center_pt = self.main_app.graph_nodes[self.slit_nid]
+        ax.scatter(center_pt[0], center_pt[1], color='lime', marker='*', s=400, edgecolors='black', zorder=10)
+        ax.annotate(f"Slit N{self.slit_nid}\n(Main)", (center_pt[0], center_pt[1]),
+                    xytext=(12, 12), textcoords='offset points', fontweight='bold', color='green')
+
+        for nid in connected_nodes:
+            if nid == self.slit_nid: continue
+            pt = self.main_app.graph_nodes[nid]
+            ax.scatter(pt[0], pt[1], color='blue', marker='o', s=100, edgecolors='black', zorder=5)
+            ax.annotate(f"N{nid}\n(Adjacent)", (pt[0], pt[1]),
+                        xytext=(8, -15), textcoords='offset points', color='blue', fontsize=9)
+
+        for nid in dummy_nodes:
+            pt = self.main_app.graph_nodes[nid]
+            ax.scatter(pt[0], pt[1], color='red', marker='X', s=150, edgecolors='black', zorder=11)
+            ax.annotate(f"N{nid}\n(Dummy)", (pt[0], pt[1]),
+                        xytext=(12, -25), textcoords='offset points', color='red', fontweight='bold', fontsize=9)
+
+        ax.set_aspect('equal')
+        ax.grid(True, linestyle=':', alpha=0.6)
+
+        handles, labels = ax.get_legend_handles_labels()
+        by_label = dict(zip(labels, handles))
+        if by_label:
+            ax.legend(by_label.values(), by_label.keys(), loc='best')
+
+        self.canvas.draw()
+
+
+class CellLoopViewerDialog(QDialog):
+    def __init__(self, main_app):
+        super().__init__(main_app)
+        self.main_app = main_app
+        self.setWindowTitle("다중 폐단면 방향성(Sign Multiplier) 일괄 매핑 검증")
+        self.resize(1100, 900)
+
+        layout = QVBoxLayout(self)
+
+        info_label = QLabel(
+            "<b>[다중 폐단면 셀(Cell) 방향 계수 일괄 검증]</b><br>"
+            "모든 셀의 <b>반시계(CCW) 경로</b>와 정정 전단류($q_b$) <b>계산 경로</b>를 대조한 결과가 한 번에 출력됩니다.<br>"
+            "각 숫자는 해당 셀의 내부 방향으로 자동 오프셋되어 표시되므로 공유 격벽의 부호 분배를 한눈에 확인할 수 있습니다.<br>"
+            "<span style='color:blue;'><b>+1</b></span>: 방향 일치 | <span style='color:red;'><b>-1</b></span>: 방향 반대 (충돌) | 표시되지 않은 외판선: 0"
+        )
+        layout.addWidget(info_label)
+
+        self.fig = Figure()
+        self.canvas = FigureCanvas(self.fig)
+        layout.addWidget(NavigationToolbar(self.canvas, self))
+        layout.addWidget(self.canvas)
+
+        self.plot_loops()
+
+    def plot_loops(self):
+        self.fig.clear()
+        ax = self.fig.add_subplot(111)
+
+        # 1. 배경: 전체 에지를 아주 옅은 회색으로 기본 배치
+        for e in self.main_app.graph_edges:
+            geom = e['geometry']
+            ax.plot(*geom.xy, color='#E5E7EB', linewidth=1.2, zorder=1)
+
+        # 정정 전단류 계산 경로 데이터 맵 구축
+        calc_dirs = {}
+        if hasattr(self.main_app, 'calc_route'):
+            for route in self.main_app.calc_route:
+                calc_dirs[route['edge_id']] = route['is_forward']
+
+        # 전체 단면의 가로세로 치수 기준 스케일 계산 (텍스트 오프셋 양 조절용)
+        nodes_arr = np.array(list(self.main_app.graph_nodes.values()))
+        max_dim = max(nodes_arr[:, 0].max() - nodes_arr[:, 0].min(),
+                      nodes_arr[:, 1].max() - nodes_arr[:, 1].min()) if len(nodes_arr) > 0 else 10000.0
+
+        import matplotlib.cm as cm
+        cmap = cm.get_cmap('tab10')
+
+        # 2. 모든 셀을 순회하며 방향 계수를 내부 방향으로 밀어 넣어 일괄 렌더링
+        for idx, cinfo in enumerate(self.main_app.cells_info):
+            color = cmap(idx % 10)
+            ordered_edges = cinfo.get('ordered_edges', [])
+            ordered_nodes = cinfo.get('ordered_nodes', [])
+
+            if not ordered_edges: continue
+
+            # 이 셀의 고유 반시계 방향 정보 추출
+            cell_ccw_dirs = {}
+            curr_n = ordered_nodes[0]
+            for eid in ordered_edges:
+                edge_data = self.main_app.graph_edges[eid]
+                if edge_data['start_node'] == curr_n:
+                    cell_ccw_dirs[eid] = True
+                    curr_n = edge_data['end_node']
+                else:
+                    cell_ccw_dirs[eid] = False
+                    curr_n = edge_data['start_node']
+
+            # 에지별 부호 판별 및 그래픽 처리
+            for eid in ordered_edges:
+                edge_data = self.main_app.graph_edges[eid]
+                geom = edge_data['geometry']
+
+                if edge_data.get('type') == 'stiffener':
+                    continue
+
+                if eid in cell_ccw_dirs and eid in calc_dirs:
+                    mult = 1 if cell_ccw_dirs[eid] == calc_dirs[eid] else -1
+                else:
+                    mult = 0
+
+                if mult == 0: continue  # 관련 없는 부재는 통과
+
+                # 셀 고유 색상으로 기하학 테두리 강조
+                coords = np.array(geom.coords)
+                ax.plot(coords[:, 0], coords[:, 1], color=color, linewidth=2.5, alpha=0.6, zorder=4)
+
+                # 중요: 선분 중간점에서 셀의 안쪽 도심(Centroid)을 향하는 방향 벡터 계산
+                pt_mid = geom.interpolate(0.5, normalized=True)
+                pt_centroid = cinfo['polygon'].centroid
+
+                vec_to_centroid = np.array([pt_centroid.x - pt_mid.x, pt_centroid.y - pt_mid.y])
+                vec_len = np.linalg.norm(vec_to_centroid)
+
+                if vec_len > 1e-6:
+                    # 도면 크기에 비례하여 적절한 가독성 거리를 띄움 (겹침 현상 원천 배제)
+                    offset_dist = min(vec_len * 0.2, max_dim * 0.03)
+                    v_norm = vec_to_centroid / vec_len
+                    text_x = pt_mid.x + v_norm[0] * offset_dist
+                    text_y = pt_mid.y + v_norm[1] * offset_dist
+                else:
+                    text_x, text_y = pt_mid.x, pt_mid.y
+
+                # 부호 매핑 배지 그리기 (+1은 파랑, -1은 빨강)
+                bg_color = 'dodgerblue' if mult == 1 else 'crimson'
+                ax.annotate(f"{mult:+d}", (text_x, text_y), color='white', weight='bold',
+                            fontsize=9, ha='center', va='center', zorder=6,
+                            bbox=dict(boxstyle="round,pad=0.15", fc=bg_color, ec='none', alpha=0.85))
+
+            # 셀 중앙 번호 라벨링
+            cx, cy = cinfo['polygon'].centroid.x, cinfo['polygon'].centroid.y
+            ax.annotate(f"Cell {cinfo['cell_id']}", (cx, cy), color='black', weight='bold',
+                        fontsize=11, ha='center', va='center', zorder=10,
+                        bbox=dict(boxstyle="round,pad=0.2", fc='white', ec=color, alpha=0.9, lw=2))
+
+        ax.set_aspect('equal')
+        ax.grid(True, linestyle=':', alpha=0.5)
+        self.canvas.draw()
+
+class CalcRouteViewerDialog(QDialog):
+    def __init__(self, main_app):
+        super().__init__(main_app)
+        self.main_app = main_app
+        self.setWindowTitle("전단류 계산 경로(Calc Route) 정밀 분석 및 q값 뷰어")
+        self.resize(1400, 800)
+
+        layout = QVBoxLayout(self)
+
+        info_label = QLabel(
+            "<b>[정정 전단류($q_b$) 탐색 경로 및 방향 확인]</b><br>"
+            "<span style='color:green;'><b>Phase 1 (초록색)</b></span>: 자유단 출발 | "
+            "<span style='color:orange;'><b>Phase 2 (주황색)</b></span>: 분기점 출발<br>"
+            "좌측 도면의 <b>색칠된 선분을 마우스로 클릭</b>하면 해당 부재의 전단류(q) 상세 변화량을 팝업으로 확인할 수 있습니다."
+        )
+        layout.addWidget(info_label)
+
+        splitter = QSplitter(Qt.Horizontal)
+
+        # --- 좌측: 도면 뷰어 ---
+        left_widget = QWidget()
+        left_layout = QVBoxLayout(left_widget)
+        left_layout.setContentsMargins(0, 0, 0, 0)
+
+        self.fig = Figure()
+        self.canvas = FigureCanvas(self.fig)
+        left_layout.addWidget(NavigationToolbar(self.canvas, self))
+        left_layout.addWidget(self.canvas)
+        splitter.addWidget(left_widget)
+
+        # --- 우측: 텍스트 로그 패널 ---
+        right_widget = QWidget()
+        right_layout = QVBoxLayout(right_widget)
+        right_layout.setContentsMargins(0, 0, 0, 0)
+
+        right_layout.addWidget(QLabel("<b>📋 [단계별 탐색 경로 및 q값 추적 로그]</b>"))
+        self.log_box = QTextEdit()
+        self.log_box.setReadOnly(True)
+        self.log_box.setStyleSheet("font-family: Consolas, monospace; font-size: 13px; background-color: #F8F9FA;")
+        right_layout.addWidget(self.log_box)
+        splitter.addWidget(right_widget)
+
+        splitter.setSizes([900, 500])
+        layout.addWidget(splitter)
+
+        # ✨ 마우스 클릭 이벤트 연결
+        self.canvas.mpl_connect('pick_event', self.on_route_edge_click)
+
+        self.plot_route()
+        self.populate_log()
+
+    def on_route_edge_click(self, event):
+        """좌측 도면에서 계산 경로 선분을 클릭했을 때 q값을 보여주는 팝업"""
+        if event.artist and hasattr(event.artist, 'get_gid'):
+            gid = event.artist.get_gid()
+            if gid is not None and str(gid).startswith("route_"):
+                eid = int(str(gid).split("_")[1])
+
+                # 클릭한 엣지의 탐색 경로 정보 찾기
+                route_info = next((r for r in self.main_app.calc_route if r['edge_id'] == eid), None)
+                if not route_info: return
+
+                phase = route_info.get('phase', 1)
+                u = route_info['from_node']
+                v = route_info['to_node']
+
+                info_text = f"🔹 <b>[탐색 경로 상세 정보]</b>\n"
+                info_text += f" - Edge ID : {eid}\n"
+                info_text += f" - 탐색 방향 : Node {u} ➔ Node {v}\n"
+                info_text += f" - Phase : {phase} ({'자유단 출발' if phase == 1 else '분기점 출발'})\n\n"
+
+                # q값 데이터 추출
+                if hasattr(self.main_app, 'edge_q_results') and eid in self.main_app.edge_q_results:
+                    chunks = self.main_app.edge_q_results[eid]
+
+                    # calc_route는 항상 from_node -> to_node 방향으로 생성되었으므로,
+                    # chunks의 첫 번째가 시작값, 마지막이 종료값입니다.
+                    q_s_unit = chunks[0]['q_start_unit']
+                    q_e_unit = chunks[-1]['q_end_unit']
+
+                    user_vy = getattr(self.main_app, 'user_Vy_total', 1000000.0)
+                    q_s_actual = q_s_unit * user_vy
+                    q_e_actual = q_e_unit * user_vy
+
+                    info_text += f"📊 <b>[정정 전단류(q_b) 계산 결과]</b>\n"
+                    info_text += f" - 🟢 시작점 (Node {u}) q 값 : {q_s_actual:,.2f} N/mm\n"
+                    info_text += f" - 🔴 종료점 (Node {v}) q 값 : {q_e_actual:,.2f} N/mm\n"
+
+                    diff = abs(q_e_actual) - abs(q_s_actual)
+                    status = "증가 ↗" if diff > 0.1 else ("감소 ↘" if diff < -0.1 else "유지 ➔")
+                    info_text += f" - 절댓값 흐름 : {status}\n"
+                else:
+                    info_text += f"❌ 전단류 계산 결과를 찾을 수 없습니다.\n"
+
+                QMessageBox.information(self, f"Route Edge {eid} (Node {u} ➔ {v})", info_text)
+
+    def populate_log(self):
+        """우측 텍스트 패널에 계산 경로와 q값을 순서대로 기록합니다."""
+        if not hasattr(self.main_app, 'calc_route') or not self.main_app.calc_route:
+            self.log_box.setText("계산 경로 데이터가 없습니다.")
+            return
+
+        log_html = ""
+        prev_to_node = None
+        path_count = 1
+
+        for i, route in enumerate(self.main_app.calc_route):
+            phase = route.get('phase', 1)
+            u = route['from_node']
+            v = route['to_node']
+            eid = route['edge_id']
+            fwd = route['is_forward']
+
+            color = "green" if phase == 1 else "darkorange"
+            phase_str = "자유단 출발" if phase == 1 else "분기점 출발"
+            dir_str = "순방향" if fwd else "역방향"
+
+            # 끊기고 새로운 경로가 시작될 때
+            if u != prev_to_node:
+                if i != 0:
+                    log_html += f"&nbsp;&nbsp; 🛑 <b>Path {path_count - 1} 종료 (End Node: {prev_to_node})</b><br><br>"
+                log_html += f"<span style='color:{color}; font-size:14px;'><b>🚀 [Path {path_count}] Phase {phase} ({phase_str})</b></span><br>"
+                log_html += f"&nbsp;&nbsp; 🟢 <b>시작 노드: Node {u}</b><br>"
+                path_count += 1
+
+            # q값 문자열 생성
+            q_text = ""
+            if hasattr(self.main_app, 'edge_q_results') and eid in self.main_app.edge_q_results:
+                chunks = self.main_app.edge_q_results[eid]
+                user_vy = getattr(self.main_app, 'user_Vy_total', 1000000.0)
+                qs = chunks[0]['q_start_unit'] * user_vy
+                qe = chunks[-1]['q_end_unit'] * user_vy
+                q_text = f" <span style='color:#003087; font-weight:bold;'>[q: {qs:,.0f} ➔ {qe:,.0f}]</span>"
+
+            # 개별 스텝 기록
+            log_html += f"&nbsp;&nbsp; [{i + 1:03d}] Node <b>{u}</b> ➔ Node <b>{v}</b> <span style='color:gray; font-size:11px;'>(Edge: {eid}, {dir_str})</span>{q_text}<br>"
+
+            prev_to_node = v
+
+        if prev_to_node is not None:
+            log_html += f"&nbsp;&nbsp; 🛑 <b>Path {path_count - 1} 최종 종료 (End Node: {prev_to_node})</b><br>"
+
+        self.log_box.setHtml(log_html)
+
+    def plot_route(self):
+        self.fig.clear()
+        ax = self.fig.add_subplot(111)
+
+        for e in self.main_app.graph_edges:
+            geom = e['geometry']
+            ax.plot(*geom.xy, color='#EEEEEE', linewidth=1, zorder=1)
+
+        if not hasattr(self.main_app, 'calc_route') or not self.main_app.calc_route:
+            return
+
+        for i, route in enumerate(self.main_app.calc_route):
+            eid = route['edge_id']
+            phase = route.get('phase', 1)
+
+            edge_data = self.main_app.graph_edges[eid]
+            geom_coords = np.array(edge_data['geometry'].coords)
+
+            if route['from_node'] == edge_data['start_node']:
+                path_coords = geom_coords
+            else:
+                path_coords = geom_coords[::-1]
+
+            color = 'limegreen' if phase == 1 else 'darkorange'
+
+            # ✨ picker=5와 gid 속성을 추가하여 선분을 클릭 가능하게 만듦
+            ax.plot(path_coords[:, 0], path_coords[:, 1], color=color, linewidth=4.0, alpha=0.7, zorder=4, picker=5,
+                    gid=f"route_{eid}")
+
+            from shapely.geometry import LineString
+            geom_line = LineString(path_coords)
+
+            if geom_line.length > 5.0:
+                pt_mid = geom_line.interpolate(0.5, normalized=True)
+                pt_next = geom_line.interpolate(0.55, normalized=True)
+
+                vec = np.array([pt_next.x - pt_mid.x, pt_next.y - pt_mid.y])
+                length = np.linalg.norm(vec)
+
+                if length > 1e-6:
+                    arrow_len = min(geom_line.length * 0.3, 100.0)
+                    dv = vec / length * arrow_len
+
+                    ax.annotate('', xy=(pt_mid.x + dv[0], pt_mid.y + dv[1]),
+                                xytext=(pt_mid.x, pt_mid.y),
+                                arrowprops=dict(arrowstyle="->", color=color, lw=3.0, shrinkA=0, shrinkB=0),
+                                zorder=5)
+
+                    ax.annotate(str(i + 1), (pt_mid.x, pt_mid.y), color='white', weight='bold', fontsize=6,
+                                ha='center', va='center', zorder=6,
+                                bbox=dict(boxstyle="circle,pad=0.1", fc='black', ec='none', alpha=0.8))
+
+        # 배경에 노드 번호를 옅게 표시하여 클릭 지점 추적을 쉽게 함
+        for nid, pt in self.main_app.graph_nodes.items():
+            ax.annotate(str(nid), (pt[0], pt[1]), color='#7F8C8D', fontsize=8, ha='center', va='center', zorder=10)
+
+        ax.set_aspect('equal')
+        ax.grid(True, linestyle=':', alpha=0.6)
+        self.canvas.draw()
+
+
+class MatrixViewerDialog(QDialog):
+    def __init__(self, main_app):
+        super().__init__(main_app)
+        self.main_app = main_app
+        self.setWindowTitle("부정정 방정식 세팅 결과 뷰어 (Matrix & Vector)")
+        self.resize(1100, 800)
+
+        # PySide6 추가 임포트 (엑셀 형태의 테이블 위젯 렌더링용)
+        from PySide6.QtWidgets import QTableWidget, QTableWidgetItem, QHeaderView
+        from PySide6.QtGui import QColor, QBrush, QFont
+        from PySide6.QtCore import Qt
+
+        layout = QVBoxLayout(self)
+
+        info_label = QLabel(
+            "<b>[부정정 전단흐름 연립방정식: [δ]{q_0} = {-Δ_0}]</b><br>"
+            "계산되어 저장된 <b>유연도 행렬([δ])</b>과 <b>초기 비틀림 변위 적분항({Δ_0})</b>입니다.<br>"
+            "<span style='color:blue;'>파란색</span>: 대각항 (각 방의 테두리 전체 강성) | "
+            "<span style='color:red;'>빨간색</span>: 비대각항 (이웃한 방과 상쇄되는 공유 격벽의 강성)"
+        )
+        layout.addWidget(info_label)
+
+        # 데이터가 없을 경우의 안전장치
+        if not hasattr(self.main_app, 'matrix_delta') or self.main_app.matrix_delta is None or len(
+                self.main_app.matrix_delta) == 0:
+            error_label = QLabel("<b>❌ 행렬 데이터가 없습니다. 먼저 1D 변환 및 계산을 실행해주세요.</b>")
+            error_label.setStyleSheet("color: red; font-size: 14px;")
+            layout.addWidget(error_label)
+            return
+
+        num_cells = len(self.main_app.cells_info)
+        mat = self.main_app.matrix_delta
+        vec = self.main_app.vector_delta0
+
+        # --- 1. 유연도 행렬 [δ] 테이블 생성 ---
+        layout.addWidget(QLabel("<h3>✅ 1. 유연도 행렬 [δ] (Flexibility Matrix)</h3>"))
+        self.table_mat = QTableWidget(num_cells, num_cells)
+
+        headers = [f"Cell {self.main_app.cells_info[i]['cell_id']}" for i in range(num_cells)]
+        self.table_mat.setHorizontalHeaderLabels(headers)
+        self.table_mat.setVerticalHeaderLabels(headers)
+
+        font_bold = QFont()
+        font_bold.setBold(True)
+
+        for i in range(num_cells):
+            for j in range(num_cells):
+                val = mat[i, j]
+                item = QTableWidgetItem(f"{val:,.3f}")
+                item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+
+                # 대각항과 비대각항 색상 분리
+                if i == j:
+                    item.setForeground(QBrush(QColor("blue")))
+                    item.setFont(font_bold)
+                    item.setBackground(QColor("#F0F8FF"))  # 대각항 옅은 파란색 배경
+                elif val != 0:
+                    item.setForeground(QBrush(QColor("crimson")))
+                else:
+                    item.setForeground(QBrush(QColor("#BDC3C7")))
+
+                self.table_mat.setItem(i, j, item)
+
+        # 글자 길이에 맞춰 셀 너비 자동 조절
+        self.table_mat.resizeColumnsToContents()
+        layout.addWidget(self.table_mat, stretch=2)
+
+        # --- 2. 우변 벡터 및 q0 테이블 생성 ---
+        has_q0 = hasattr(self.main_app, 'solved_q0')
+        col_count = 4 if has_q0 else 3
+
+        layout.addWidget(QLabel("<h3>✅ 2. 우변 벡터 및 부정정 전단류(q_0) 해답</h3>"))
+        self.table_vec = QTableWidget(num_cells, col_count)
+
+        headers = ["Cell ID", "초기 비틀림 적분 (Δ_i0)", "우변 방정식 적용 (-Δ_i0)"]
+        if has_q0: headers.append("도출된 전단류 해 (q_0)")
+
+        self.table_vec.setHorizontalHeaderLabels(headers)
+        self.table_vec.verticalHeader().setVisible(False)  # 왼쪽 인덱스 숨김
+
+        for i in range(num_cells):
+            cid = self.main_app.cells_info[i]['cell_id']
+            val = vec[i]
+
+            # 1. Cell ID
+            item_id = QTableWidgetItem(f"Cell {cid}")
+            item_id.setTextAlignment(Qt.AlignCenter)
+            item_id.setFont(font_bold)
+            item_id.setBackground(QColor("#ECEFF1"))
+            self.table_vec.setItem(i, 0, item_id)
+
+            # 2. 원래 적분값
+            item_val1 = QTableWidgetItem(f"{val:,.2f}")
+            item_val1.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            self.table_vec.setItem(i, 1, item_val1)
+
+            # 3. 우변 적용값
+            item_val2 = QTableWidgetItem(f"{-val:,.2f}")
+            item_val2.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            item_val2.setFont(font_bold)
+            item_val2.setForeground(QBrush(QColor("crimson" if -val < 0 else "dodgerblue")))
+            self.table_vec.setItem(i, 2, item_val2)
+
+            # 4. (추가) 계산된 q0 해답
+            if has_q0:
+                q0_val = self.main_app.solved_q0[i]
+                item_q0 = QTableWidgetItem(f"{q0_val:,.2f} N/mm")
+                item_q0.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                item_q0.setFont(font_bold)
+                item_q0.setForeground(QBrush(QColor("darkmagenta")))  # 강조된 보라색
+                item_q0.setBackground(QColor("#FDF5E6"))
+                self.table_vec.setItem(i, 3, item_q0)
+
+        self.table_vec.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        layout.addWidget(self.table_vec, stretch=1)
 
 
 class UltimateShipAnalyzer(QMainWindow):
@@ -115,16 +634,37 @@ class UltimateShipAnalyzer(QMainWindow):
         control_panel_layout.addWidget(gen_box)
 
         self.btn_load = QPushButton("1. DXF Load 📂")
-        self.btn_load.setFixedHeight(45)
+        self.btn_load.setFixedHeight(40)
         self.btn_load.setObjectName("btnGreen")
         self.btn_load.clicked.connect(self.load_and_process_dxf)
         control_panel_layout.addWidget(self.btn_load)
 
-        self.btn_calc = QPushButton("2. 1D 변환 및 최종 전단류 계산 🚀")
-        self.btn_calc.setFixedHeight(45)
+        self.btn_calc = QPushButton("2. 1D 변환 및 정렬 📐")
+        self.btn_calc.setFixedHeight(40)
         self.btn_calc.setObjectName("btnGreen")
         self.btn_calc.clicked.connect(self.process_1d_geometry)
         control_panel_layout.addWidget(self.btn_calc)
+
+        self.btn_view_loops = QPushButton("3. 셀 순환 경로 확인 🔄")
+        self.btn_view_loops.setFixedHeight(40)
+        self.btn_view_loops.setObjectName("btnGreen")
+        self.btn_view_loops.setEnabled(False)  # 계산 완료 후 활성화
+        self.btn_view_loops.clicked.connect(self.show_cell_loops)
+        control_panel_layout.addWidget(self.btn_view_loops)
+
+        # ✨ 여기에 4번 버튼 코드 추가!
+        self.btn_view_route = QPushButton("4. 전단류 계산 경로 확인 ➡️")
+        self.btn_view_route.setFixedHeight(40)
+        self.btn_view_route.setObjectName("btnGreen")
+        self.btn_view_route.clicked.connect(self.show_calc_route)
+        control_panel_layout.addWidget(self.btn_view_route)
+
+        self.btn_view_matrix = QPushButton("5. 부정정 행렬 세팅 확인 🧮")
+        self.btn_view_matrix.setFixedHeight(40)
+        self.btn_view_matrix.setObjectName("btnGreen")
+        self.btn_view_matrix.setEnabled(False)
+        self.btn_view_matrix.clicked.connect(self.show_matrix_viewer)
+        control_panel_layout.addWidget(self.btn_view_matrix)
 
         control_panel_layout.addStretch()
         main_layout.addWidget(control_panel)
@@ -133,7 +673,7 @@ class UltimateShipAnalyzer(QMainWindow):
         work_layout = QVBoxLayout(work_area)
         viz_splitter = QSplitter(Qt.Horizontal)
 
-        for i, title in enumerate(["[1. Final Healed 1D Geometry]", "[2. Final Shear Flow (q_b + q_0)]"]):
+        for i, title in enumerate(["[Final Healed 1D Geometry]", "[Graphified Hull Cross-Section]"]):
             container = QWidget()
             lay = QVBoxLayout(container)
             lay.addWidget(QLabel(f"<b>{title}</b>"))
@@ -147,13 +687,14 @@ class UltimateShipAnalyzer(QMainWindow):
 
             if i == 1:
                 can.mpl_connect('pick_event', self.on_edge_click)
+                can.mpl_connect('pick_event', self.on_slit_node_click)
 
         work_layout.addWidget(viz_splitter, stretch=7)
 
         self.result_box = QTextEdit()
         self.result_box.setObjectName("resultBox")
         self.result_box.setReadOnly(True)
-        self.result_box.setFixedHeight(220)
+        self.result_box.setFixedHeight(200)
         work_layout.addWidget(self.result_box)
         main_layout.addWidget(work_area, stretch=7)
 
@@ -486,8 +1027,8 @@ class UltimateShipAnalyzer(QMainWindow):
         self.btn_calc.setEnabled(False)
         self.btn_load.setEnabled(False)
 
-        progress = QProgressDialog("Calculating Structural Integrity...", "Cancel", 0, 100, self)
-        progress.setWindowTitle("HHI-FAIVE Processing")
+        progress = QProgressDialog("1D Transformation Processing...", "Cancel", 0, 100, self)
+        progress.setWindowTitle("Processing...")
         progress.setWindowModality(Qt.WindowModal)
         progress.setAutoClose(True)
         progress.show()
@@ -1064,6 +1605,7 @@ class UltimateShipAnalyzer(QMainWindow):
 
             self.hull_only_centerlines = [cl.copy() for cl in all_cl]
 
+            # ✨ [요구사항 1, 6 반영] 6001~9001 보강재 중심선 매칭 및 생성
             progress.setLabelText("Processing Stiffeners (6001~9001)...")
             raw_stiffs = c6001 + c7001 + c8001 + c9001
             stiff_s_raw = []
@@ -1076,6 +1618,7 @@ class UltimateShipAnalyzer(QMainWindow):
             stiff_cl = create_continuous_stiffener_centerlines(stiff_pairs)
             for c in stiff_cl:
                 c['type'] = 'stiffener'
+                # 요구사항 6: 6001~9001 스티프너는 연한 회색으로 시각화
                 c['color'] = '#D3D3D3'
 
             all_cl.extend(stiff_cl)
@@ -1121,7 +1664,8 @@ class UltimateShipAnalyzer(QMainWindow):
             sum_qx = 0.0
             segments_1d = []
 
-            keep_box = box(-9999999.0, -9999999.0, getattr(self, 'x_cut', 0.0) + 0.5, 9999999.0)
+            # 순수 I_xx 계산 시에도 잘려나간 우현을 무시하고, 전단류 계산과 완벽히 동일한 반단면 박스로 잘라서 통일
+            keep_box = box(-9999999.0, -9999999.0, self.x_cut + 0.5, 9999999.0)
 
             for cl in all_cl:
                 geom = cl['line']
@@ -1182,17 +1726,19 @@ class UltimateShipAnalyzer(QMainWindow):
                     f"- Hull + Mass Point 중립축 : {self.shear_calc_na_y:,.2f} mm\n"
                     f"- Half Moment of Inertia   : {self.shear_calc_ixx_half:,.0f} mm⁴\n"
                     f"- Full Moment of Inertia   : {self.shear_calc_ixx_full:,.0f} mm⁴\n"
+                    f"(※ Point Mass 변환으로 인해 I_local 값 분실로 극소량의 차이가 발생할 수 있으나 정상입니다.)"
                 )
 
             summary_text = (
-                "✅ 1D Transformation & Shear Flow Calculation Complete!\n\n"
+                "✅ 1D Transformation & Full Healing Complete!\n\n"
                 f"- Extracted Outer Hull Lines (1999): {len(cl1999)}\n"
                 f"- Aligned Internal Lines (1102, 157): {len(self.aligned_internal)}\n"
                 f"- Added Stiffeners (6001~9001): {len(stiff_cl)}\n"
                 f"- Final Healed Elements: {len(all_cl)}"
                 f"{calc_result_text}"
                 f"{self.graph_summary}"
-                f"{getattr(self, 'cell_equation_summary', '')}"
+                f"{getattr(self, 'cell_summary', '')}"
+                f"{getattr(self, 'cell_equation_summary', '')}" 
                 f"{shear_ixx_text}"
             )
             self.result_box.setText(summary_text)
@@ -1208,6 +1754,8 @@ class UltimateShipAnalyzer(QMainWindow):
             self.is_processing = False
             self.btn_calc.setEnabled(True)
             self.btn_load.setEnabled(True)
+            self.btn_view_loops.setEnabled(True)
+            self.btn_view_matrix.setEnabled(True)
 
     def build_graph(self):
         from collections import defaultdict
@@ -1324,7 +1872,7 @@ class UltimateShipAnalyzer(QMainWindow):
                 'end_node': e['v'], 'end_coord': self.graph_nodes[e['v']],
                 'thickness': e['thickness'], 'length': geom.length,
                 'geometry': geom, 'type': e['type'],
-                'mass_points': []
+                'mass_points': []  # 초기화
             })
 
         self.graph_summary = (
@@ -1340,6 +1888,7 @@ class UltimateShipAnalyzer(QMainWindow):
         from shapely.ops import polygonize, unary_union
         from shapely.geometry import LinearRing
         from collections import defaultdict
+        import numpy as np
 
         self.cells_info = []
         self.edge_to_cells = {e['id']: [] for e in self.graph_edges}
@@ -1356,6 +1905,7 @@ class UltimateShipAnalyzer(QMainWindow):
             bound = poly.boundary
             for eid, e in enumerate(self.graph_edges):
                 geom = e['geometry']
+                # 곡선의 오차 방지를 위해 정중앙점(interpolate 0.5)을 사용해 엣지 포함 여부 엄격 판별
                 pt_on_line = geom.interpolate(0.5, normalized=True)
                 if bound.distance(pt_on_line) < 1e-2:
                     cell_edges.append(eid)
@@ -1368,6 +1918,7 @@ class UltimateShipAnalyzer(QMainWindow):
                 'edges': cell_edges
             })
 
+        # ✨ 각 셀의 실제 곡선 경로 전체 좌표계를 조립하여 반시계(CCW) 판별
         for cinfo in self.cells_info:
             cell_edges = cinfo['edges']
             if not cell_edges: continue
@@ -1384,6 +1935,7 @@ class UltimateShipAnalyzer(QMainWindow):
             ordered_edges = []
             visited_edges = set()
 
+            # 한붓그리기 경로 추적
             while len(visited_edges) < len(cell_edges):
                 moved = False
                 for nxt, eid in adj[curr_node]:
@@ -1396,6 +1948,7 @@ class UltimateShipAnalyzer(QMainWindow):
                         break
                 if not moved: break
 
+            # ✨ [핵심 교체] 직선 노드가 아닌 곡선 전체를 하나의 링(Ring)으로 조립
             full_path_coords = []
             curr_n = start_node
 
@@ -1410,9 +1963,13 @@ class UltimateShipAnalyzer(QMainWindow):
                     full_path_coords.extend(geom_coords[::-1][:-1])
                     curr_n = edge_data['start_node']
 
+            # 루프 닫기
             full_path_coords.append(full_path_coords[0])
+
+            # Shapely의 내부 연산을 통해 완벽하게 정밀한 곡선 기반 방향성 도출
             ring = LinearRing(full_path_coords)
 
+            # 만약 시계방향(CW)이라면 배열의 순서를 완전히 뒤집어 반시계(CCW)로 교정
             if not ring.is_ccw:
                 ordered_nodes.reverse()
                 ordered_edges.reverse()
@@ -1501,10 +2058,12 @@ class UltimateShipAnalyzer(QMainWindow):
         self.flowchart_slit_nodes = list(set(slit_nodes_ids))
         self.remaining_edges_info = working_edges
 
+    # ✨ [요구사항 2, 3, 4 처리] 보강재 질점 매핑 함수 (무게중심 좌표 추가)
     def process_stiffener_mass_points(self):
         keep_box = box(-9999999.0, -9999999.0, self.x_cut + 0.5, 9999999.0)
         stiff_lines = []
 
+        # 반단면 컷팅된 스티프너만 수집
         for cl in self.final_healed_centerlines:
             if cl.get('type') == 'stiffener':
                 clipped = cl['line'].intersection(keep_box)
@@ -1536,19 +2095,20 @@ class UltimateShipAnalyzer(QMainWindow):
         for edge in self.graph_edges:
             edge['mass_points'] = []
 
+        # 가장 가까운 외판/격벽에 스티프너 무조건 귀속
         for grp in groups:
             grp_area = 0.0
             grp_qy = 0.0
 
             for s in grp:
                 thk = s.get('thickness', 10.0)
-                if thk < 1.0: thk = 10.0
+                if thk < 1.0: thk = 10.0  # 스티프너 두께 0 수렴 방지
                 area = s['line'].length * thk
                 grp_area += area
                 grp_qy += area * s['line'].centroid.y
 
             centroid_y = grp_qy / grp_area if grp_area > 0 else 0.0
-            grp_geom = unary_union([s['line'] for s in grp])
+            grp_geom = unary_union([s['line'] for s in grp])  # 스티프너 전체 형상
 
             best_eid = -1
             min_dist = float('inf')
@@ -1561,6 +2121,7 @@ class UltimateShipAnalyzer(QMainWindow):
                     min_dist = dist
                     best_eid = edge['id']
 
+            # 500mm 내의 가장 가까운 엣지(157, -1102, 1999)에 100% 매칭
             if best_eid != -1 and min_dist < 500.0:
                 p_edge, _ = nearest_points(self.graph_edges[best_eid]['geometry'], grp_geom)
                 self.graph_edges[best_eid]['mass_points'].append({
@@ -1570,6 +2131,7 @@ class UltimateShipAnalyzer(QMainWindow):
                 })
 
     def calculate_determinate_shear_flow(self, Vy_total=1000000.0):
+        # ✨ 스티프너를 질점(Mass Point)으로 변환 후 귀속
         self.process_stiffener_mass_points()
 
         nodes = self.graph_nodes
@@ -1578,6 +2140,7 @@ class UltimateShipAnalyzer(QMainWindow):
             if self.graph_edges[eid].get('type') != 'stiffener':
                 edges[eid] = e_info
 
+        # 1. 질점을 포함한 단면적 및 중립축(NA_y) 계산
         total_area = 0.0
         sum_qx = 0.0
         for eid, e in edges.items():
@@ -1596,8 +2159,9 @@ class UltimateShipAnalyzer(QMainWindow):
 
         if total_area < 1e-6: return
         na_y = sum_qx / total_area
-        self.shear_calc_area_half = total_area
+        self.shear_calc_area_half = total_area  # 추적용 변수 추가
 
+        # 2. 질점을 포함한 반단면 기준 이너시아(Ixx_half) 계산
         ixx_half = 0.0
         for eid, e in edges.items():
             geom = self.graph_edges[eid]['geometry']
@@ -1622,6 +2186,7 @@ class UltimateShipAnalyzer(QMainWindow):
         self.shear_calc_ixx_full = ixx_half * 2
         self.shear_calc_na_y = na_y
 
+        # 전체 부착된 스티프너 면적 검증용
         self.total_stiffener_area = sum(mp['area'] for e in self.graph_edges for mp in e.get('mass_points', []))
 
         from collections import defaultdict
@@ -1678,7 +2243,7 @@ class UltimateShipAnalyzer(QMainWindow):
                                 d1, d2 = k * (L_total / num_chunks), (k + 1) * (L_total / num_chunks)
                             else:
                                 d1, d2 = L_total - (k + 1) * (L_total / num_chunks), L_total - k * (
-                                        L_total / num_chunks)
+                                            L_total / num_chunks)
 
                             sub_geom = substring(geom, min(d1, d2), max(d1, d2))
                             if sub_geom.length < 1e-6: continue
@@ -1686,6 +2251,7 @@ class UltimateShipAnalyzer(QMainWindow):
                             y_bar = sub_geom.centroid.y - na_y
                             dS_z = A_sub * y_bar
 
+                            # ✨ 해당 구간에 질점(스티프너)이 포함되어 있는지 확인 및 누적 모멘트 dS_z 추가 (실제 무게중심 적용)
                             for mp in list(unprocessed_mps):
                                 mp_dist = geom.project(Point(mp['pt']))
                                 if min(d1, d2) - 1e-3 <= mp_dist <= max(d1, d2) + 1e-3:
@@ -1761,7 +2327,7 @@ class UltimateShipAnalyzer(QMainWindow):
                                         d1, d2 = k * (L_total / num_chunks), (k + 1) * (L_total / num_chunks)
                                     else:
                                         d1, d2 = L_total - (k + 1) * (L_total / num_chunks), L_total - k * (
-                                                L_total / num_chunks)
+                                                    L_total / num_chunks)
 
                                     sub_geom = substring(geom, min(d1, d2), max(d1, d2))
                                     if sub_geom.length < 1e-6: continue
@@ -1769,6 +2335,7 @@ class UltimateShipAnalyzer(QMainWindow):
                                     y_bar = sub_geom.centroid.y - na_y
                                     dS_z = A_sub * y_bar
 
+                                    # ✨ 해당 구간에 질점(스티프너)이 포함되어 있는지 확인 및 누적 모멘트 dS_z 추가 (실제 무게중심 적용)
                                     for mp in list(unprocessed_mps):
                                         mp_dist = geom.project(Point(mp['pt']))
                                         if min(d1, d2) - 1e-3 <= mp_dist <= max(d1, d2) + 1e-3:
@@ -1802,6 +2369,7 @@ class UltimateShipAnalyzer(QMainWindow):
         self.user_Vy_total = Vy_total
 
     def setup_indeterminate_equations(self):
+        """1단계 & 2단계: 유연도 행렬 [δ]과 초기 비틀림 벡터 {Δ0} 계산 및 저장"""
         num_cells = len(self.cells_info) if hasattr(self, 'cells_info') else 0
         if num_cells == 0:
             self.matrix_delta = np.array([])
@@ -1819,6 +2387,7 @@ class UltimateShipAnalyzer(QMainWindow):
 
         user_vy = getattr(self, 'user_Vy_total', 1000000.0)
 
+        # 각 셀(Cell)을 순회하며 방정식의 계수 세팅
         for idx_i, cell_i in enumerate(self.cells_info):
             delta_i0 = 0.0
             delta_ii = 0.0
@@ -1826,6 +2395,7 @@ class UltimateShipAnalyzer(QMainWindow):
             ordered_edges = cell_i.get('ordered_edges', [])
             ordered_nodes = cell_i.get('ordered_nodes', [])
 
+            # CCW 방향 매핑 (1, -1 방향 계수 판별용)
             cell_ccw_dirs = {}
             if ordered_edges:
                 curr_n = ordered_nodes[0]
@@ -1841,11 +2411,13 @@ class UltimateShipAnalyzer(QMainWindow):
             for eid in ordered_edges:
                 edge_data = self.graph_edges[eid]
                 thk = edge_data.get('thickness', 10.0)
-                if thk < 0.1: thk = 0.1
+                if thk < 0.1: thk = 0.1  # ZeroDivision 방지
                 length = edge_data['geometry'].length
 
+                # 2단계: [δ_ii] 대각항 누적 (ds / t)
                 delta_ii += length / thk
 
+                # 1단계: [Δ_i0] 우변 벡터 누적 (q_b / t * ds)
                 if eid in self.edge_q_results and eid in calc_dirs:
                     mult = 1 if cell_ccw_dirs[eid] == calc_dirs[eid] else -1
 
@@ -1855,6 +2427,7 @@ class UltimateShipAnalyzer(QMainWindow):
                         qs = chunk['q_start_unit'] * user_vy
                         qe = chunk['q_end_unit'] * user_vy
 
+                        # 사다리꼴 적분법(Trapezoidal rule) 적용
                         q_avg = (qs + qe) / 2.0
                         edge_qb_integral += (q_avg / thk) * chunk_len
 
@@ -1863,6 +2436,7 @@ class UltimateShipAnalyzer(QMainWindow):
             delta_matrix[idx_i, idx_i] = delta_ii
             delta0_vector[idx_i] = delta_i0
 
+            # 2단계: [δ_ij] 비대각항 (공유 격벽) 세팅
             for idx_j in range(idx_i + 1, num_cells):
                 cell_j = self.cells_info[idx_j]
                 shared_edges = set(ordered_edges).intersection(set(cell_j.get('ordered_edges', [])))
@@ -1873,47 +2447,55 @@ class UltimateShipAnalyzer(QMainWindow):
                     thk = edge_data.get('thickness', 10.0)
                     if thk < 0.1: thk = 0.1
                     length = edge_data['geometry'].length
+
+                    # CCW 기준으로 공유 격벽의 회전 방향은 항상 반대이므로 무조건 빼기(-)
                     delta_ij -= length / thk
 
                 delta_matrix[idx_i, idx_j] = delta_ij
-                delta_matrix[idx_j, idx_i] = delta_ij
+                delta_matrix[idx_j, idx_i] = delta_ij  # 대칭 행렬 특성 적용
 
+        # 계산된 데이터를 인스턴스 변수에 영구 저장 (다음 단계에 사용)
         self.matrix_delta = delta_matrix
         self.vector_delta0 = delta0_vector
 
         self.cell_equation_summary = (
-            f"\n\n🧩 [방정식 세팅 완료]\n"
-            f"- 유연도 행렬 [δ] : {num_cells} x {num_cells} 생성\n"
+            f"\n\n🧩 [부정정 방정식 세팅 완료]\n"
+            f"- 유연도 행렬 [δ] : {num_cells} x {num_cells} 생성 완료\n"
+            f"- 우변 벡터 {{Δ0}} : {num_cells} x 1 생성 완료\n"
         )
 
     def solve_indeterminate_and_superpose(self):
+        """3단계 & 4단계: 연립방정식 풀이(q0 도출) 및 최종 전단흐름 합산"""
         if getattr(self, 'matrix_delta', None) is None or len(self.matrix_delta) == 0:
             return
 
         try:
-            # 1. 역행렬 풀이: q0 해 도출
+            # 1. 연립방정식 풀이: [δ] {q0} = {-Δ0}
+            # 파이썬 내부 선형대수 솔버를 통해 0.01초 만에 해를 도출합니다.
             q0_actual = np.linalg.solve(self.matrix_delta, -self.vector_delta0)
-            self.solved_q0 = q0_actual
+            self.solved_q0 = q0_actual  # 결과 저장
 
             num_cells = len(self.cells_info)
             user_vy = getattr(self, 'user_Vy_total', 1000000.0)
 
-            # 2. 결과 텍스트 요약
-            q0_summary = "\n\n🎯 [최종 부정정 전단흐름(q0) 해 도출]\n"
+            # 2. 결과 텍스트 출력용 포맷팅 (로그창 출력용)
+            q0_summary = "\n\n🎯 [최종 부정정 전단흐름(q0) 해 도출 완료]\n"
             q0_summary += "----------------------------------------\n"
             for i in range(num_cells):
                 cid = self.cells_info[i]['cell_id']
                 val = q0_actual[i]
                 q0_summary += f" - Cell {cid:02d} 회전 전단류(q0) : {val:+,.2f} N/mm\n"
             q0_summary += "----------------------------------------\n"
+
             self.cell_equation_summary += q0_summary
 
-            # 3. Superposition(합산)을 위한 방향 매핑
+            # 3. 최종 전단흐름 합산 (Superposition)
             calc_dirs = {}
             if hasattr(self, 'calc_route'):
                 for route in self.calc_route:
                     calc_dirs[route['edge_id']] = route['is_forward']
 
+            # 각 부재(Edge)마다 더해져야 할 총 q0 값을 누적할 딕셔너리
             edge_q0_sum_actual = defaultdict(float)
 
             for idx_i, cell_i in enumerate(self.cells_info):
@@ -1929,96 +2511,80 @@ class UltimateShipAnalyzer(QMainWindow):
                     is_ccw_fwd = (edge_data['start_node'] == curr_n)
                     curr_n = edge_data['end_node'] if is_ccw_fwd else edge_data['start_node']
 
+                    # 🔥 방향 계수 매핑: q_b 계산 방향과 방의 회전 방향이 같으면 더하고, 다르면 뺍니다.
                     if eid in calc_dirs:
                         mult = 1 if is_ccw_fwd == calc_dirs[eid] else -1
                         edge_q0_sum_actual[eid] += mult * q0_val
 
-            # 4. 정정 전단류(q_b)에 부정정 전단류(q_0) 합산 적용
+            # 4. 기존 정정 전단류(q_b) 결과에 계산된 q_0를 단위 하중 스케일로 합산
             for eid, chunks in self.edge_q_results.items():
                 if eid in edge_q0_sum_actual:
+                    # q_b가 단위하중당 흐름(1/mm)으로 저장되어 있으므로, q0도 Vy로 나누어 더해줌
                     q0_unit_to_add = edge_q0_sum_actual[eid] / user_vy
                     for chunk in chunks:
                         chunk['q_start_unit'] += q0_unit_to_add
                         chunk['q_end_unit'] += q0_unit_to_add
 
-            # 5. ✨ 최대 전단응력 계산 및 위치 기록 (텍스트창 출력 및 X마크용)
-            max_tau = 0.0
-            max_tau_pt = None
-            for eid, chunks in self.edge_q_results.items():
-                thk = self.graph_edges[eid].get('thickness', 10.0)
-                if thk < 0.1: thk = 0.1
-                for chunk in chunks:
-                    tau_s = abs(chunk['q_start_unit'] * user_vy / thk)
-                    tau_e = abs(chunk['q_end_unit'] * user_vy / thk)
-                    if tau_s > max_tau:
-                        max_tau = tau_s
-                        max_tau_pt = chunk['geom'].coords[0]
-                    if tau_e > max_tau:
-                        max_tau = tau_e
-                        max_tau_pt = chunk['geom'].coords[-1]
-
-            self.global_max_tau_val = max_tau
-            self.global_max_tau_pt = max_tau_pt
-
-            if max_tau_pt is not None:
-                max_summary = "\n\n🔥 [최대 전단응력 발생 정보]\n"
-                max_summary += "----------------------------------------\n"
-                max_summary += f" - 최대 응력 : {max_tau:,.2f} N/mm²\n"
-                max_summary += f" - 발생 위치 : X={max_tau_pt[0]:.1f}, Y={max_tau_pt[1]:.1f}\n"
-                max_summary += "----------------------------------------\n"
-                self.cell_equation_summary += max_summary
-
+        except np.linalg.LinAlgError:
+            self.cell_equation_summary += "\n\n❌ [오류] 연립방정식 행렬이 특이행렬(Singular Matrix)이어서 해를 구할 수 없습니다."
         except Exception as e:
-            self.cell_equation_summary += f"\n\n❌ [오류] 부정정 전단류 계산 중 에러: {str(e)}"
+            self.cell_equation_summary += f"\n\n❌ [오류] 부정정 전단류 합산 중 에러 발생: {str(e)}"
 
     def on_edge_click(self, event):
-        # 오직 선분(edge) 클릭시에만 반응하도록 필터링
         if event.artist and hasattr(event.artist, 'get_gid'):
             gid = event.artist.get_gid()
             if gid is not None and str(gid).startswith("edge_"):
                 edge_id = int(str(gid).split("_")[1])
                 edge = self.graph_edges[edge_id]
 
-                # 폐루프 정보 매핑
-                cell_texts = []
-                if hasattr(self, 'cells_info'):
-                    for cinfo in self.cells_info:
-                        if edge_id in cinfo.get('edges', []):
-                            cell_texts.append(f"Cell {cinfo['cell_id']}")
-
-                cell_info_str = ", ".join(cell_texts) if cell_texts else "Open Section"
-
-                # 요구사항에 맞춘 팝업 정보 구성
                 info_text = (
-                    f"🔹 [부재 정보]\n"
-                    f" - 부재 ID  : {edge_id}\n"
-                    f" - 시작노드 : {edge['start_node']}\n"
-                    f" - 끝노드   : {edge['end_node']}\n"
-                    f" - 길이     : {edge['length'] / 1000.0:,.3f} m\n"
-                    f" - 두께     : {edge['thickness']} mm\n"
-                    f" - 폐루프 정보 : {cell_info_str}\n"
+                    f"🔹 [선분 상세 정보]\n\n"
+                    f" - 부재 타입 : {edge['type']}\n"
+                    f" - 시작 노드 : Node {edge['start_node']} (X: {edge['start_coord'][0]:.1f}, Y: {edge['start_coord'][1]:.1f})\n"
+                    f" - 끝 노드   : Node {edge['end_node']} (X: {edge['end_coord'][0]:.1f}, Y: {edge['end_coord'][1]:.1f})\n"
+                    f" - 두께(t)   : {edge['thickness']} mm\n"
+                    f" - 길이(L)   : {edge['length']:,.2f} mm\n"
                 )
+
+                if 'mass_points' in edge and edge['mass_points']:
+                    info_text += f" - 부착된 보강재 질점 개수: {len(edge['mass_points'])} 개\n"
+                    tot_mass_area = sum([m['area'] for m in edge['mass_points']])
+                    info_text += f" - 부착된 스티프너 총면적: {tot_mass_area:,.2f} mm²\n"
 
                 if hasattr(self, 'edge_q_results') and edge_id in self.edge_q_results:
                     chunks = self.edge_q_results[edge_id]
-                    q_s_unit = chunks[0]['q_start_unit']
-                    q_e_unit = chunks[-1]['q_end_unit']
+                    q_s_unit, q_e_unit = chunks[0]['q_start_unit'], chunks[-1]['q_end_unit']
 
                     user_vy = getattr(self, 'user_Vy_total', 1000000.0)
-                    q_s_actual = q_s_unit * user_vy
-                    q_e_actual = q_e_unit * user_vy
+                    q_s_actual, q_e_actual = q_s_unit * user_vy, q_e_unit * user_vy
 
                     thk = edge['thickness']
-                    tau_s_actual = q_s_actual / thk
-                    tau_e_actual = q_e_actual / thk
+                    tau_s_actual, tau_e_actual = q_s_actual / thk, q_e_actual / thk
 
-                    info_text += f"\n📊 [전단류 및 전단응력 결과]\n"
-                    info_text += f" - 시작점 단위 힘당 전단류 : {q_s_unit:,.6e} 1/mm\n"
-                    info_text += f" - 종료점 단위 힘당 전단류 : {q_e_unit:,.6e} 1/mm\n"
-                    info_text += f" - 시작점 전단응력 : {tau_s_actual:,.2f} N/mm²\n"
-                    info_text += f" - 종료점 전단응력 : {tau_e_actual:,.2f} N/mm²\n"
+                    if hasattr(self, 'edge_to_cells') and edge_id in self.edge_to_cells:
+                        belonging_cells = self.edge_to_cells[edge_id]
+                        if len(belonging_cells) == 0:
+                            shared_text = "일반 개단면 부재 (폐루프 미포함)"
+                        elif len(belonging_cells) == 1:
+                            shared_text = f"외판/독립 격벽 (Cell {belonging_cells[0]} 단독 소속)"
+                        else:
+                            shared_text = f"🔥 공유 격벽 (Shared Web) - Cell {belonging_cells} 사이 연결"
 
-                QMessageBox.information(self, f"Edge Information (ID: {edge_id})", info_text)
+                        info_text += f"\n\n🟩 [위상수학적 셀(Cell) 정보]\n - 소속 상태 : {shared_text}\n"
+
+                QMessageBox.information(self, f"Edge ID: {edge_id}", info_text)
+
+    def on_slit_node_click(self, event):
+        """슬릿 노드 클릭 시 위상 팝업창을 띄우는 이벤트 핸들러 (모델리스 방식)"""
+        if event.artist and hasattr(event.artist, 'get_gid'):
+            gid = event.artist.get_gid()
+            if gid is not None and str(gid).startswith("slit_"):
+                nid = int(str(gid).split("_")[1])
+
+                # 인스턴스 변수에 바인딩하여 백그라운드 소멸 방지 및 NonModal 설정
+                self.slit_dialog = SlitViewerDialog(self, nid)
+                self.slit_dialog.setWindowModality(Qt.NonModal)
+                self.slit_dialog.show()
 
     def refresh_ui(self):
         if hasattr(self, 'cbar') and self.cbar is not None:
@@ -2033,7 +2599,9 @@ class UltimateShipAnalyzer(QMainWindow):
         ax1, ax2 = self.fig1.add_subplot(111), self.fig2.add_subplot(111)
 
         if self.is_calculated:
+            # [도면 1, 2] 배경 스티프너 및 외판 렌더링
             if hasattr(self, 'final_healed_centerlines'):
+                # 도면 2 반단면 컷팅을 위한 박스 생성
                 keep_box = box(-9999999.0, -9999999.0, getattr(self, 'x_cut', 0.0) + 0.5, 9999999.0)
 
                 for cl in self.final_healed_centerlines:
@@ -2043,6 +2611,7 @@ class UltimateShipAnalyzer(QMainWindow):
                     thk = cl.get('thickness', 10.0)
                     visual_thk = thk if thk >= 50.0 else 50.0
 
+                    # 1번 도면(전체 형상) 렌더링
                     if visual_thk > 0:
                         try:
                             poly = lo.buffer(visual_thk / 2.0, cap_style=2)
@@ -2055,6 +2624,7 @@ class UltimateShipAnalyzer(QMainWindow):
                             pass
                     ax1.plot(*lo.xy, color=final_color, linewidth=2.0, alpha=0.9, zorder=10)
 
+                    # ✨ 2번 도면(전단류 뷰) 렌더링 - 스티프너 반단면 컷팅 적용
                     if c_type == 'stiffener':
                         clipped_lo = lo.intersection(keep_box)
                         if not clipped_lo.is_empty:
@@ -2064,6 +2634,14 @@ class UltimateShipAnalyzer(QMainWindow):
                                 ax2.plot(*cg.xy, color='#D3D3D3', linewidth=2.0, alpha=0.9, zorder=4)
 
             if hasattr(self, 'graph_edges'):
+                if hasattr(self, 'cells_info') and self.cells_info:
+                    for cinfo in self.cells_info:
+                        poly, cid = cinfo['polygon'], cinfo['cell_id']
+                        ax2.annotate(f"Cell {cid}", (poly.centroid.x, poly.centroid.y), color='black', weight='bold',
+                                     fontsize=12,
+                                     ha='center', va='center', zorder=25,
+                                     bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="black", alpha=0.9, lw=1.5))
+
                 if hasattr(self, 'edge_q_results') and self.edge_q_results:
                     import matplotlib.colors as mcolors
                     import matplotlib.cm as cm
@@ -2129,6 +2707,7 @@ class UltimateShipAnalyzer(QMainWindow):
                                     if not is_fwd:
                                         tg = -tg
 
+                                    # Normal Vector 계산
                                     n_vecs[p_idx] = np.array([-tg[1], tg[0]])
                                 top_pts = c + n_vecs * (taus_signed[:, np.newaxis] * visual_scale)
 
@@ -2159,16 +2738,39 @@ class UltimateShipAnalyzer(QMainWindow):
                             ax2.plot(*geom.xy, color='dodgerblue', linewidth=2.5, alpha=0.8, zorder=10, picker=5,
                                      gid=f"edge_{eid}")
 
+                        if 'mass_points' in edge_data:
+                            for mp in edge_data['mass_points']:
+                                ax2.scatter(mp['pt'][0], mp['pt'][1], color='darkgray', s=35, marker='o', zorder=35,
+                                            edgecolors='black')
+
+                    cut_edge_ids = [c['edge_id'] for c in self.cut_edges_info] if hasattr(self,
+                                                                                          'cut_edges_info') else []
+                    for eid in cut_edge_ids:
+                        if eid < len(self.graph_edges):
+                            geom = self.graph_edges[eid]['geometry']
+                            ax2.plot(*geom.xy, color='#BDC3C7', linewidth=2.5, linestyle='--', zorder=5)
+
                     sm = plt.cm.ScalarMappable(cmap=cmap, norm=norm)
                     sm.set_array([])
                     self.cbar = self.fig2.colorbar(sm, ax=ax2, fraction=0.046, pad=0.04)
-                    self.cbar.set_label(f'Final Shear Stress τ (N/mm²)\n[Total Vy = {user_vy:,.0f} N]',
+                    self.cbar.set_label(f'Signed Shear Stress τ_d (MPa)\n[Total Vy = {user_vy:,.0f} N 적용]',
                                         fontweight='bold', fontsize=10)
 
-                # ✨ 최대 전단응력 지점 표시 (프로브 텍스트 없이 붉은 X 마크만 크게 표시)
-                if getattr(self, 'global_max_tau_pt', None) is not None:
-                    ax2.plot(self.global_max_tau_pt[0], self.global_max_tau_pt[1],
-                             marker='x', color='red', markersize=15, markeredgewidth=3, zorder=50)
+                node_xs, node_ys = [pt[0] for pt in self.graph_nodes.values()], [pt[1] for pt in
+                                                                                 self.graph_nodes.values()]
+                ax2.scatter(node_xs, node_ys, color='red', s=40, zorder=20, edgecolors='black')
+
+                for nid, pt in self.graph_nodes.items():
+                    ax2.annotate(str(nid), (pt[0], pt[1]), xytext=(4, 4), textcoords='offset points', color='black',
+                                 fontsize=9, fontweight='bold', zorder=25)
+
+                if hasattr(self, 'flowchart_slit_nodes') and self.flowchart_slit_nodes:
+                    for i, nid in enumerate(self.flowchart_slit_nodes):
+                        if nid in self.graph_nodes:
+                            pt, label = self.graph_nodes[nid], 'Slit Position (Cut Node)' if i == 0 else ""
+                            ax2.scatter(pt[0], pt[1], color='lime', marker='*', s=250, zorder=30, edgecolors='black',
+                                        picker=5, gid=f"slit_{nid}", label=label)
+                    ax2.legend(loc='upper right')
 
         else:
             if hasattr(self, 'raw_1999_lines') and self.raw_1999_lines:
@@ -2183,6 +2785,24 @@ class UltimateShipAnalyzer(QMainWindow):
 
         self.can1.draw()
         self.can2.draw()
+
+    def show_cell_loops(self):
+        """셀 순환 검증 팝업창을 띄웁니다 (모델리스 방식)"""
+        self.loop_dialog = CellLoopViewerDialog(self)
+        self.loop_dialog.setWindowModality(Qt.NonModal)
+        self.loop_dialog.show()
+
+    def show_calc_route(self):
+        """계산 경로 검증 팝업창을 띄웁니다 (모델리스 방식)"""
+        self.route_dialog = CalcRouteViewerDialog(self)
+        self.route_dialog.setWindowModality(Qt.NonModal)
+        self.route_dialog.show()
+
+    def show_matrix_viewer(self):
+        """행렬 데이터 확인 팝업창 띄우기"""
+        self.matrix_dialog = MatrixViewerDialog(self)
+        self.matrix_dialog.setWindowModality(Qt.NonModal)
+        self.matrix_dialog.show()
 
 
 if __name__ == "__main__":
