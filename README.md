@@ -22,8 +22,9 @@ from matplotlib.ticker import FuncFormatter
 from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                                QPushButton, QLabel, QTextEdit, QFileDialog, QLineEdit,
                                QHBoxLayout, QScrollArea, QFrame, QSplitter, QComboBox,
-                               QInputDialog, QMessageBox, QProgressDialog, QRadioButton, QDialog)
-from PySide6.QtGui import QTextCursor, QIcon
+                               QInputDialog, QMessageBox, QProgressDialog, QRadioButton, QDialog,
+                               QTableWidget, QTableWidgetItem, QHeaderView)
+from PySide6.QtGui import QTextCursor, QIcon, QColor
 from PySide6.QtCore import Qt
 
 from shapely.geometry import LineString, Polygon, Point, box
@@ -552,6 +553,56 @@ class MatrixViewerDialog(QDialog):
         layout.addWidget(self.table_vec, stretch=1)
 
 
+class HullThicknessDialog(QDialog):
+    def __init__(self, main_app, segments):
+        super().__init__(main_app)
+        self.setWindowTitle("외판 피스(Piece)별 두께 입력")
+        self.resize(450, 500)
+
+        layout = QVBoxLayout(self)
+        info_label = QLabel(
+            "<b>[-1204 레이어에 의해 분할된 1999 외판 두께 설정]</b><br>"
+            "Y좌표 내림차순(상갑판 ➔ 선저 방향)으로 정렬되어 있습니다.<br>"
+            "각 외판 피스별 설계 두께를 입력해주세요."
+        )
+        layout.addWidget(info_label)
+
+        self.table = QTableWidget(len(segments), 2)
+        self.table.setHorizontalHeaderLabels(["외판 피스 위치 (Y좌표)", "두께 t (mm)"])
+        self.table.verticalHeader().setVisible(False)
+        self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+        self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
+
+        for i, seg in enumerate(segments):
+            y_mid = seg.centroid.y
+            item_desc = QTableWidgetItem(f"Piece {i + 1} (Y: {y_mid:,.1f})")
+            item_desc.setFlags(Qt.ItemIsSelectable | Qt.ItemIsEnabled)
+            item_desc.setBackground(QColor("#F8F9FA"))
+            self.table.setItem(i, 0, item_desc)
+
+            item_thk = QTableWidgetItem("10.0")  # 기본 두께
+            item_thk.setTextAlignment(Qt.AlignCenter)
+            self.table.setItem(i, 1, item_thk)
+
+        layout.addWidget(self.table)
+
+        btn_ok = QPushButton("두께 적용 및 1D 변환 시작")
+        btn_ok.setFixedHeight(35)
+        btn_ok.setStyleSheet("background-color: #00AD1D; color: white; font-weight: bold;")
+        btn_ok.clicked.connect(self.accept)
+        layout.addWidget(btn_ok)
+
+    def get_thicknesses(self):
+        thk_list = []
+        for i in range(self.table.rowCount()):
+            try:
+                val = float(self.table.item(i, 1).text())
+            except ValueError:
+                val = 10.0
+            thk_list.append(val)
+        return thk_list
+
+
 class UltimateShipAnalyzer(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -639,32 +690,22 @@ class UltimateShipAnalyzer(QMainWindow):
         self.btn_load.clicked.connect(self.load_and_process_dxf)
         control_panel_layout.addWidget(self.btn_load)
 
+        # ✨ 좌측 외판 두께 입력 테이블 세팅
+        control_panel_layout.addWidget(QLabel("<b>[반단면 외판 두께 설정]</b>"))
+        self.table_thk = QTableWidget()
+        self.table_thk.setColumnCount(2)
+        self.table_thk.setHorizontalHeaderLabels(["피스 (Y좌표)", "두께 t(mm)"])
+        self.table_thk.verticalHeader().setVisible(False)
+        self.table_thk.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+        self.table_thk.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        self.table_thk.setFixedHeight(450)
+        control_panel_layout.addWidget(self.table_thk)
+
         self.btn_calc = QPushButton("2. 1D 변환 및 정렬 📐")
         self.btn_calc.setFixedHeight(40)
         self.btn_calc.setObjectName("btnGreen")
         self.btn_calc.clicked.connect(self.process_1d_geometry)
         control_panel_layout.addWidget(self.btn_calc)
-
-        self.btn_view_loops = QPushButton("3. 셀 순환 경로 확인 🔄")
-        self.btn_view_loops.setFixedHeight(40)
-        self.btn_view_loops.setObjectName("btnGreen")
-        self.btn_view_loops.setEnabled(False)  # 계산 완료 후 활성화
-        self.btn_view_loops.clicked.connect(self.show_cell_loops)
-        control_panel_layout.addWidget(self.btn_view_loops)
-
-        # ✨ 여기에 4번 버튼 코드 추가!
-        self.btn_view_route = QPushButton("4. 전단류 계산 경로 확인 ➡️")
-        self.btn_view_route.setFixedHeight(40)
-        self.btn_view_route.setObjectName("btnGreen")
-        self.btn_view_route.clicked.connect(self.show_calc_route)
-        control_panel_layout.addWidget(self.btn_view_route)
-
-        self.btn_view_matrix = QPushButton("5. 부정정 행렬 세팅 확인 🧮")
-        self.btn_view_matrix.setFixedHeight(40)
-        self.btn_view_matrix.setObjectName("btnGreen")
-        self.btn_view_matrix.setEnabled(False)
-        self.btn_view_matrix.clicked.connect(self.show_matrix_viewer)
-        control_panel_layout.addWidget(self.btn_view_matrix)
 
         control_panel_layout.addStretch()
         main_layout.addWidget(control_panel)
@@ -673,7 +714,7 @@ class UltimateShipAnalyzer(QMainWindow):
         work_layout = QVBoxLayout(work_area)
         viz_splitter = QSplitter(Qt.Horizontal)
 
-        for i, title in enumerate(["[Final Healed 1D Geometry]", "[Graphified Hull Cross-Section]"]):
+        for i, title in enumerate(["[Preview / Final Healed 1D Geometry]", "[Graphified Hull / Internal]"]):
             container = QWidget()
             lay = QVBoxLayout(container)
             lay.addWidget(QLabel(f"<b>{title}</b>"))
@@ -878,34 +919,17 @@ class UltimateShipAnalyzer(QMainWindow):
 
     def robust_heal_1999(self, line_infos, max_gap=500.0):
         if not line_infos: return []
-        from shapely.ops import linemerge
 
-        raw_lines = [info['line'] for info in line_infos]
-        merged_geom = linemerge(raw_lines)
-
-        if merged_geom.geom_type == 'LineString':
-            merged_lines = [merged_geom]
-        elif merged_geom.geom_type == 'MultiLineString':
-            merged_lines = list(merged_geom.geoms)
-        else:
-            merged_lines = raw_lines
-
-        new_infos = []
-        for geom in merged_lines:
-            new_infos.append({
-                'line': geom,
-                'thickness': 10.0,
-                'type': '1999',
-                'color': '#333333'
-            })
+        # 합쳐버리는 linemerge를 배제하고 개별 속성을 그대로 보존
+        new_infos = line_infos.copy()
 
         endpoints = []
         for i, info in enumerate(new_infos):
             c = list(info['line'].coords)
             if len(c) < 2: continue
             if np.linalg.norm(np.array(c[0]) - np.array(c[-1])) > 1e-3:
-                endpoints.append({'idx': i, 'pt': np.array(c[0])})
-                endpoints.append({'idx': i, 'pt': np.array(c[-1])})
+                endpoints.append({'idx': i, 'pt': np.array(c[0]), 'thk': info.get('thickness', 10.0)})
+                endpoints.append({'idx': i, 'pt': np.array(c[-1]), 'thk': info.get('thickness', 10.0)})
 
         used_pts = set()
         bridges = []
@@ -917,6 +941,8 @@ class UltimateShipAnalyzer(QMainWindow):
 
             for j, ep2 in enumerate(endpoints):
                 if i == j or j in used_pts: continue
+                if ep1['idx'] == ep2['idx']: continue  # 같은 부재의 양 끝점은 잇지 않음
+
                 dist = np.linalg.norm(ep1['pt'] - ep2['pt'])
                 if dist <= best_dist:
                     best_dist = dist
@@ -924,9 +950,11 @@ class UltimateShipAnalyzer(QMainWindow):
 
             if best_j != -1:
                 ep2 = endpoints[best_j]
+                # 브릿지 구간은 연결되는 두 피스의 평균 두께를 사용
+                avg_thk = (ep1['thk'] + ep2['thk']) / 2.0
                 bridges.append({
                     'line': LineString([tuple(ep1['pt']), tuple(ep2['pt'])]),
-                    'thickness': 10.0,
+                    'thickness': avg_thk,
                     'type': '1999',
                     'color': '#FF0000'
                 })
@@ -943,6 +971,9 @@ class UltimateShipAnalyzer(QMainWindow):
         self.reset_analysis_data()
         self.result_box.clear()
         self.current_dxf_path = fname
+
+        self.table_thk.setRowCount(0)  # 기존 테이블 초기화
+
         try:
             scale = float(self.txt_scale.text())
             try:
@@ -981,11 +1012,13 @@ class UltimateShipAnalyzer(QMainWindow):
             shift = lambda ls: LineString([(p[0] - self.cx, p[1] - self.cy_base) for p in ls.coords])
 
             self.raw_1999_lines = [shift(ls) for ls in t_1999]
+            self.raw_1204_lines = [shift(ls) for ls in t_1204]  # 시각화용 컷터 저장
+
             m_1999 = unary_union(self.raw_1999_lines)
             self.hull_centroid = m_1999.centroid
 
             cutters = []
-            for c in [shift(ls) for ls in t_1204]:
+            for c in self.raw_1204_lines:
                 c_coords = list(c.coords)
                 p1, p2 = np.array(c_coords[0]), np.array(c_coords[-1])
                 v = p2 - p1
@@ -1003,7 +1036,8 @@ class UltimateShipAnalyzer(QMainWindow):
 
             self.left_1999_segments = []
             for g in pieces:
-                if g.length > 50.0:
+                # ✨ 핵심: 대칭 연산을 위해 x=0 기준 왼쪽 반단면만 필터링합니다. (약간의 공차 1.0 허용)
+                if g.length > 50.0 and g.centroid.x <= 1.0:
                     self.left_1999_segments.append(g)
 
             self.left_1999_segments.sort(key=lambda s: (-round(s.centroid.y, 2), s.centroid.x))
@@ -1016,13 +1050,44 @@ class UltimateShipAnalyzer(QMainWindow):
             self.lines_7001 = [shift(ls) for ls in t_layers["7001"]]
             self.lines_8001 = [shift(ls) for ls in t_layers["8001"]]
             self.lines_9001 = [shift(ls) for ls in t_layers["9001"]]
+
+            # ✨ 테이블에 피스 항목 채우기
+            self.table_thk.setRowCount(len(self.left_1999_segments))
+            for i, seg in enumerate(self.left_1999_segments):
+                y_mid = seg.centroid.y
+                item_desc = QTableWidgetItem(f"P{i + 1} (Y:{y_mid:,.0f})")
+                item_desc.setFlags(Qt.ItemIsSelectable | Qt.ItemIsEnabled)
+                item_desc.setBackground(QColor("#F8F9FA"))
+                self.table_thk.setItem(i, 0, item_desc)
+
+                item_thk = QTableWidgetItem("10.0")
+                item_thk.setTextAlignment(Qt.AlignCenter)
+                self.table_thk.setItem(i, 1, item_thk)
+
             self.refresh_ui()
-            self.result_box.append(f"✅ Successfully loaded: {os.path.basename(fname)}")
+            self.result_box.append(f"✅ Successfully loaded: {os.path.basename(fname)}\n"
+                                   f"👉 1. 좌측 도면에서 외판의 절단 상태 및 번호(P1, P2...)를 확인하세요.\n"
+                                   f"👉 2. 좌측 테이블에 각 반단면 외판 피스별 두께를 입력하세요.\n"
+                                   f"👉 3. 입력이 완료되면 [2. 1D 변환 및 정렬] 버튼을 눌러 계산을 진행합니다.")
         except Exception as e:
             self.result_box.setText(f"❌ Load Error Detailed:\n{traceback.format_exc()}")
 
     def process_1d_geometry(self):
         if self.is_processing: return
+
+        if not hasattr(self, 'left_1999_segments') or not self.left_1999_segments:
+            QMessageBox.warning(self, "경고", "처리할 1999 외판 부재가 없습니다. 먼저 DXF를 로드해주세요.")
+            return
+
+        # ✨ 계산 시작 전, 테이블에서 입력된 외판 두께를 리스트로 읽어 들임
+        segment_thicknesses = []
+        for i in range(self.table_thk.rowCount()):
+            try:
+                val = float(self.table_thk.item(i, 1).text())
+            except ValueError:
+                val = 10.0  # 숫자 형식이 아니면 기본값 10
+            segment_thicknesses.append(val)
+
         self.is_processing = True
         self.btn_calc.setEnabled(False)
         self.btn_load.setEnabled(False)
@@ -1516,8 +1581,10 @@ class UltimateShipAnalyzer(QMainWindow):
             QApplication.processEvents()
 
             y_mins = []
-            for l_seg in self.left_1999_segments:
-                y_mins.append(l_seg.bounds[1] - 10.0 / 2.0)
+            for idx, l_seg in enumerate(self.left_1999_segments):
+                # 컷팅 기준점을 잡기 위해 가장 하단에 배치된 피스의 두께를 참조
+                thk = segment_thicknesses[idx] if idx < len(segment_thicknesses) else 10.0
+                y_mins.append(l_seg.bounds[1] - thk / 2.0)
             thickness_y_min = min(y_mins) if y_mins else 0.0
 
             c1102 = [affinity.translate(l, yoff=-thickness_y_min) for l in self.lines_1102_raw]
@@ -1530,10 +1597,19 @@ class UltimateShipAnalyzer(QMainWindow):
             c9001 = [affinity.translate(l, yoff=-thickness_y_min) for l in self.lines_9001]
 
             cl1999 = []
-            for ls in l1999s:
+            for idx, ls in enumerate(l1999s):
                 if ls.length > 50.0:
-                    cl1999.append({'line': ls, 'thickness': 10.0, 'type': '1999', 'color': '#333333'})
+                    # ✨ 사용자가 UI 표에 입력한 각각의 피스별 두께를 할당
+                    thk = segment_thicknesses[idx] if idx < len(segment_thicknesses) else 10.0
 
+                    # [1] 원본 (좌측 반단면 외판)
+                    cl1999.append({'line': ls, 'thickness': thk, 'type': '1999', 'color': '#333333'})
+
+                    # ✨ [2] 대칭 (우측 반단면 외판) - 원점(0,0) 기준 X축 반전 생성
+                    mirrored_ls = affinity.scale(ls, xfact=-1.0, yfact=1.0, origin=(0, 0))
+                    cl1999.append({'line': mirrored_ls, 'thickness': thk, 'type': '1999', 'color': '#333333'})
+
+            # 좌/우로 생성된 전체 외판 조각들을 하나로 결합 및 힐링
             cl1999 = self.robust_heal_1999(cl1999, max_gap=300.0)
 
             s1102_raw, s157_raw = [], []
@@ -1605,7 +1681,6 @@ class UltimateShipAnalyzer(QMainWindow):
 
             self.hull_only_centerlines = [cl.copy() for cl in all_cl]
 
-            # ✨ [요구사항 1, 6 반영] 6001~9001 보강재 중심선 매칭 및 생성
             progress.setLabelText("Processing Stiffeners (6001~9001)...")
             raw_stiffs = c6001 + c7001 + c8001 + c9001
             stiff_s_raw = []
@@ -1618,7 +1693,6 @@ class UltimateShipAnalyzer(QMainWindow):
             stiff_cl = create_continuous_stiffener_centerlines(stiff_pairs)
             for c in stiff_cl:
                 c['type'] = 'stiffener'
-                # 요구사항 6: 6001~9001 스티프너는 연한 회색으로 시각화
                 c['color'] = '#D3D3D3'
 
             all_cl.extend(stiff_cl)
@@ -1664,7 +1738,6 @@ class UltimateShipAnalyzer(QMainWindow):
             sum_qx = 0.0
             segments_1d = []
 
-            # 순수 I_xx 계산 시에도 잘려나간 우현을 무시하고, 전단류 계산과 완벽히 동일한 반단면 박스로 잘라서 통일
             keep_box = box(-9999999.0, -9999999.0, self.x_cut + 0.5, 9999999.0)
 
             for cl in all_cl:
@@ -1738,7 +1811,7 @@ class UltimateShipAnalyzer(QMainWindow):
                 f"{calc_result_text}"
                 f"{self.graph_summary}"
                 f"{getattr(self, 'cell_summary', '')}"
-                f"{getattr(self, 'cell_equation_summary', '')}" 
+                f"{getattr(self, 'cell_equation_summary', '')}"
                 f"{shear_ixx_text}"
             )
             self.result_box.setText(summary_text)
@@ -1754,8 +1827,6 @@ class UltimateShipAnalyzer(QMainWindow):
             self.is_processing = False
             self.btn_calc.setEnabled(True)
             self.btn_load.setEnabled(True)
-            self.btn_view_loops.setEnabled(True)
-            self.btn_view_matrix.setEnabled(True)
 
     def build_graph(self):
         from collections import defaultdict
@@ -2599,11 +2670,9 @@ class UltimateShipAnalyzer(QMainWindow):
         ax1, ax2 = self.fig1.add_subplot(111), self.fig2.add_subplot(111)
 
         if self.is_calculated:
-            # [도면 1, 2] 배경 스티프너 및 외판 렌더링
+            # 기존의 계산 완료 후 렌더링 로직 유지
             if hasattr(self, 'final_healed_centerlines'):
-                # 도면 2 반단면 컷팅을 위한 박스 생성
                 keep_box = box(-9999999.0, -9999999.0, getattr(self, 'x_cut', 0.0) + 0.5, 9999999.0)
-
                 for cl in self.final_healed_centerlines:
                     lo = cl['line']
                     c_type = cl.get('type')
@@ -2611,7 +2680,6 @@ class UltimateShipAnalyzer(QMainWindow):
                     thk = cl.get('thickness', 10.0)
                     visual_thk = thk if thk >= 50.0 else 50.0
 
-                    # 1번 도면(전체 형상) 렌더링
                     if visual_thk > 0:
                         try:
                             poly = lo.buffer(visual_thk / 2.0, cap_style=2)
@@ -2624,14 +2692,12 @@ class UltimateShipAnalyzer(QMainWindow):
                             pass
                     ax1.plot(*lo.xy, color=final_color, linewidth=2.0, alpha=0.9, zorder=10)
 
-                    # ✨ 2번 도면(전단류 뷰) 렌더링 - 스티프너 반단면 컷팅 적용
                     if c_type == 'stiffener':
                         clipped_lo = lo.intersection(keep_box)
                         if not clipped_lo.is_empty:
-                            c_geoms = [clipped_lo] if clipped_lo.geom_type == 'LineString' else \
-                                list(clipped_lo.geoms) if clipped_lo.geom_type == 'MultiLineString' else []
-                            for cg in c_geoms:
-                                ax2.plot(*cg.xy, color='#D3D3D3', linewidth=2.0, alpha=0.9, zorder=4)
+                            c_geoms = [clipped_lo] if clipped_lo.geom_type == 'LineString' else list(
+                                clipped_lo.geoms) if clipped_lo.geom_type == 'MultiLineString' else []
+                            for cg in c_geoms: ax2.plot(*cg.xy, color='#D3D3D3', linewidth=2.0, alpha=0.9, zorder=4)
 
             if hasattr(self, 'graph_edges'):
                 if hasattr(self, 'cells_info') and self.cells_info:
@@ -2645,7 +2711,6 @@ class UltimateShipAnalyzer(QMainWindow):
                 if hasattr(self, 'edge_q_results') and self.edge_q_results:
                     import matplotlib.colors as mcolors
                     import matplotlib.cm as cm
-
                     max_tau = 1e-9
                     user_vy = getattr(self, 'user_Vy_total', 1000000.0)
 
@@ -2660,7 +2725,6 @@ class UltimateShipAnalyzer(QMainWindow):
                     nodes_arr = np.array(list(self.graph_nodes.values()))
                     max_dim = max(nodes_arr[:, 0].max() - nodes_arr[:, 0].min(),
                                   nodes_arr[:, 1].max() - nodes_arr[:, 1].min()) if len(nodes_arr) > 0 else 10000.0
-
                     visual_scale = (max_dim * 0.05) / max_tau if max_tau > 1e-9 else 1.0
                     cmap = cm.turbo
                     norm = mcolors.Normalize(vmin=0, vmax=max_tau)
@@ -2681,7 +2745,6 @@ class UltimateShipAnalyzer(QMainWindow):
                             chunks_ordered = res_list if is_fwd else list(reversed(res_list))
 
                             all_c_pts, all_top_pts, all_taus = [], [], []
-
                             for chunk in chunks_ordered:
                                 sub_geom = chunk['geom']
                                 tau_s_signed = (chunk['q_start_unit'] * user_vy) / thk
@@ -2701,13 +2764,9 @@ class UltimateShipAnalyzer(QMainWindow):
                                         tg = c[-1] - c[-2]
                                     else:
                                         tg = c[p_idx + 1] - c[p_idx - 1]
-
                                     tg_len = np.linalg.norm(tg)
                                     tg = tg / tg_len if tg_len > 1e-6 else base_tg
-                                    if not is_fwd:
-                                        tg = -tg
-
-                                    # Normal Vector 계산
+                                    if not is_fwd: tg = -tg
                                     n_vecs[p_idx] = np.array([-tg[1], tg[0]])
                                 top_pts = c + n_vecs * (taus_signed[:, np.newaxis] * visual_scale)
 
@@ -2725,7 +2784,6 @@ class UltimateShipAnalyzer(QMainWindow):
                                 py = [all_c_pts[idx_pt, 1], all_c_pts[idx_pt + 1, 1], all_top_pts[idx_pt + 1, 1],
                                       all_top_pts[idx_pt, 1]]
                                 fc = cmap(norm(np.mean(np.abs(all_taus[idx_pt:idx_pt + 2]))))
-
                                 ax2.fill(px, py, color=fc, alpha=0.6, edgecolor='none', zorder=8)
                                 ax2.plot([all_top_pts[idx_pt, 0], all_top_pts[idx_pt + 1, 0]],
                                          [all_top_pts[idx_pt, 1], all_top_pts[idx_pt + 1, 1]], color=fc, linewidth=1.5,
@@ -2773,10 +2831,39 @@ class UltimateShipAnalyzer(QMainWindow):
                     ax2.legend(loc='upper right')
 
         else:
+            # ✨ 2. DXF Load 직후 계산 전 프리뷰 모드 렌더링
             if hasattr(self, 'raw_1999_lines') and self.raw_1999_lines:
                 for ls in self.raw_1999_lines:
-                    ax1.plot(*ls.xy, color='black', lw=1.2, alpha=0.8, zorder=5)
-                    ax2.plot(*ls.xy, color='black', lw=1.2, alpha=0.8, zorder=5)
+                    ax1.plot(*ls.xy, color='#E0E0E0', lw=1.2, zorder=1)  # 뒷배경에 원본 외판 희미하게 표시
+
+            if hasattr(self, 'raw_1204_lines') and self.raw_1204_lines:
+                for ls in self.raw_1204_lines:
+                    ax1.plot(*ls.xy, color='red', lw=2.0, linestyle='--', zorder=2)  # 컷팅 라인 빨간 점선
+
+            if hasattr(self, 'left_1999_segments') and self.left_1999_segments:
+                import matplotlib.cm as cm
+                colors = cm.get_cmap('tab10')
+                for i, ls in enumerate(self.left_1999_segments):
+                    c = colors(i % 10)
+                    ax1.plot(*ls.xy, color=c, lw=3.5, zorder=5)
+                    # 원(bbox)을 제거하고 텍스트 색상을 검은색으로 변경
+                    ax1.annotate(f"P{i + 1}", (ls.centroid.x, ls.centroid.y), color='black', weight='bold', fontsize=11,
+                                 ha='center', va='center', zorder=10)
+
+            # ax2에는 내부 격벽 및 보강재 1D 변환 대기열 표시
+            all_internal_raw = []
+            if hasattr(self, 'lines_1102_raw'): all_internal_raw.extend(self.lines_1102_raw)
+            if hasattr(self, 'lines_157'): all_internal_raw.extend(self.lines_157)
+            if hasattr(self, 'lines_6001'): all_internal_raw.extend(self.lines_6001)
+            if hasattr(self, 'lines_7001'): all_internal_raw.extend(self.lines_7001)
+            if hasattr(self, 'lines_8001'): all_internal_raw.extend(self.lines_8001)
+            if hasattr(self, 'lines_9001'): all_internal_raw.extend(self.lines_9001)
+
+            for ls in all_internal_raw:
+                ax2.plot(*ls.xy, color='dodgerblue', lw=1.0, alpha=0.5, zorder=3)
+
+            ax1.set_title("[-1204 컷팅 및 반단면 외판 분할 프리뷰]", fontweight='bold')
+            ax2.set_title("[내부 부재 1D 변환 대기열]", fontweight='bold')
 
         for ax in [ax1, ax2]:
             ax.set_aspect('equal')
