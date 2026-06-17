@@ -640,6 +640,22 @@ class UltimateShipAnalyzer(QMainWindow):
         self.graph_summary = ""
 
         self.flowchart_slit_nodes = []
+        self.shell_thickness_inputs = []
+
+        self.saved_frames_data = []
+        self.act_fb = 0.0
+        self.act_fs = 0.0
+        self.allow_fb = 0.0
+        self.allow_fs = 0.0
+        self.raw_swbm = 0.0
+        self.raw_shear = 0.0
+        self.calc_depth = 0.0
+        self.calc_z_top = 0.0
+        self.calc_z_btm = 0.0
+        self.max_shell_thk = 0.0
+        self.max_mesh_coords = (0, 0)
+        self.unit_q_val = 0.0
+        self.max_shell_q_idx = -1
 
     def init_ui(self):
         self.setStyleSheet("""
@@ -660,29 +676,51 @@ class UltimateShipAnalyzer(QMainWindow):
         main_container = QWidget()
         main_layout = QHBoxLayout(main_container)
 
-        self.field_width = 100
+        self.field_width = 90
 
         control_panel = QWidget()
-        control_panel.setFixedWidth(300)
+        control_panel.setFixedWidth(350)
         control_panel_layout = QVBoxLayout(control_panel)
         control_panel_layout.setAlignment(Qt.AlignTop)
 
+        # [General Settings]
         gen_box = QFrame()
         gen_box.setObjectName("settingBox")
         gen_vbox = QVBoxLayout(gen_box)
         gen_vbox.addWidget(QLabel("<b>[General Settings]</b>"))
 
-        for lbl, attr, dval in [("Scale:", "txt_scale", "100"), ("H-Ext (mm):", "txt_ext", "10"),
-                                ("V-Ext (mm):", "txt_perp", "10"), ("Total Vy (t):", "txt_vy", "100")]:
+        for lbl, attr, dval in [("Scale:", "txt_scale", "100"),
+                                ("H-Ext (mm):", "txt_ext", "10"),
+                                ("V-Ext (mm):", "txt_perp", "10")]:
             h = QHBoxLayout()
             h.addWidget(QLabel(lbl))
             h.addStretch()
             le = QLineEdit(dval)
             le.setFixedWidth(self.field_width)
+            le.setAlignment(Qt.AlignRight)  # ✨ 오른쪽 정렬 추가
             setattr(self, attr, le)
             h.addWidget(le)
             gen_vbox.addLayout(h)
         control_panel_layout.addWidget(gen_box)
+
+        # [Load Settings]
+        load_box = QFrame()
+        load_box.setObjectName("settingBox")
+        load_vbox = QVBoxLayout(load_box)
+        load_vbox.addWidget(QLabel("<b>[Load Settings]</b>"))
+
+        for lbl, attr, dval in [("S.W.B.M (tm):", "txt_swbm", ""),
+                                ("Shear (t):", "txt_vy", "")]:
+            h = QHBoxLayout()
+            h.addWidget(QLabel(lbl))
+            h.addStretch()
+            le = QLineEdit(dval)
+            le.setFixedWidth(self.field_width)
+            le.setAlignment(Qt.AlignRight)  # ✨ 오른쪽 정렬 추가
+            setattr(self, attr, le)
+            h.addWidget(le)
+            load_vbox.addLayout(h)
+        control_panel_layout.addWidget(load_box)
 
         self.btn_load = QPushButton("1. DXF Load 📂")
         self.btn_load.setFixedHeight(40)
@@ -690,16 +728,16 @@ class UltimateShipAnalyzer(QMainWindow):
         self.btn_load.clicked.connect(self.load_and_process_dxf)
         control_panel_layout.addWidget(self.btn_load)
 
-        # ✨ 좌측 외판 두께 입력 테이블 세팅
-        control_panel_layout.addWidget(QLabel("<b>[반단면 외판 두께 설정]</b>"))
-        self.table_thk = QTableWidget()
-        self.table_thk.setColumnCount(2)
-        self.table_thk.setHorizontalHeaderLabels(["피스 (Y좌표)", "두께 t(mm)"])
-        self.table_thk.verticalHeader().setVisible(False)
-        self.table_thk.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
-        self.table_thk.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
-        self.table_thk.setFixedHeight(450)
-        control_panel_layout.addWidget(self.table_thk)
+        # ✨ float22 방식의 스크롤 컨테이너 적용
+        control_panel_layout.addWidget(QLabel("<b>[S/SHELL Thickness (mm)]</b>"))
+        self.thickness_scroll = QScrollArea()
+        self.thickness_scroll.setWidgetResizable(True)
+        self.thickness_scroll.setMinimumHeight(300)
+        self.scroll_content = QWidget()
+        self.thickness_layout = QVBoxLayout(self.scroll_content)
+        self.thickness_layout.setAlignment(Qt.AlignTop)
+        self.thickness_scroll.setWidget(self.scroll_content)
+        control_panel_layout.addWidget(self.thickness_scroll, stretch=1)
 
         self.btn_calc = QPushButton("2. 1D 변환 및 정렬 📐")
         self.btn_calc.setFixedHeight(40)
@@ -707,6 +745,63 @@ class UltimateShipAnalyzer(QMainWindow):
         self.btn_calc.clicked.connect(self.process_1d_geometry)
         control_panel_layout.addWidget(self.btn_calc)
 
+        # [Strength Analysis setting]
+        eval_box = QFrame()
+        eval_box.setObjectName("settingBox")
+        eval_vbox = QVBoxLayout(eval_box)
+        eval_vbox.addWidget(QLabel("<b>[Strength Analysis setting]</b>"))
+
+        self.combo_section = QComboBox()
+        self.combo_section.addItems(["Continuous", "Discontinuous"])
+        self.combo_section.setFixedWidth(self.field_width)
+
+        self.combo_hull = QComboBox()
+        self.combo_hull.addItems(["S/H", "D/H"])
+        self.combo_hull.setEnabled(False)
+        self.combo_hull.setFixedWidth(self.field_width)
+
+        h_sec = QHBoxLayout()
+        h_sec.addWidget(QLabel("Continuity:"))
+        h_sec.addStretch()
+        h_sec.addWidget(self.combo_section)
+        eval_vbox.addLayout(h_sec)
+
+        h_hull = QHBoxLayout()
+        h_hull.addWidget(QLabel("Hull Type:"))
+        h_hull.addStretch()
+        h_hull.addWidget(self.combo_hull)
+        eval_vbox.addLayout(h_hull)
+
+        self.combo_section.currentTextChanged.connect(
+            lambda text: self.combo_hull.setEnabled(text == "Discontinuous")
+        )
+
+        h_mat = QHBoxLayout()
+        h_mat.addWidget(QLabel("Material:"))
+        h_mat.addStretch()
+        self.combo_material_type = QComboBox()
+        self.combo_material_type.addItems(["Mild", "H.T", "H.T with BKT 450", "H.T with BKT 850"])
+        self.combo_material_type.setFixedWidth(self.field_width)
+        h_mat.addWidget(self.combo_material_type)
+        eval_vbox.addLayout(h_mat)
+
+        h_k = QHBoxLayout()
+        h_k.addWidget(QLabel("Grade (K):"))
+        h_k.addStretch()
+        self.txt_grade_k = QLineEdit("1.00")
+        self.txt_grade_k.setFixedWidth(self.field_width)
+        self.txt_grade_k.setAlignment(Qt.AlignRight)  # ✨ 오른쪽 정렬 추가
+        h_k.addWidget(self.txt_grade_k)
+        eval_vbox.addLayout(h_k)
+
+        self.btn_eval = QPushButton("3. STRENGTH Analysis ⛓️")
+        self.btn_eval.setFixedHeight(40)
+        self.btn_eval.setObjectName("btnGreen")
+        self.btn_eval.setEnabled(False)
+        self.btn_eval.clicked.connect(self.evaluate_strength)
+        eval_vbox.addWidget(self.btn_eval)
+
+        control_panel_layout.addWidget(eval_box)
         control_panel_layout.addStretch()
         main_layout.addWidget(control_panel)
 
@@ -714,7 +809,7 @@ class UltimateShipAnalyzer(QMainWindow):
         work_layout = QVBoxLayout(work_area)
         viz_splitter = QSplitter(Qt.Horizontal)
 
-        for i, title in enumerate(["[Preview / Final Healed 1D Geometry]", "[Graphified Hull / Internal]"]):
+        for i, title in enumerate(["[Section Geometry]", "[Shear Stress Heatmap]"]):
             container = QWidget()
             lay = QVBoxLayout(container)
             lay.addWidget(QLabel(f"<b>{title}</b>"))
@@ -739,8 +834,39 @@ class UltimateShipAnalyzer(QMainWindow):
         work_layout.addWidget(self.result_box)
         main_layout.addWidget(work_area, stretch=7)
 
+        history_panel = QWidget()
+        history_panel.setFixedWidth(300)
+        history_layout = QVBoxLayout(history_panel)
+        history_layout.setAlignment(Qt.AlignTop)
+        history_layout.addWidget(QLabel("<b>[Saved Frames]</b>"))
+
+        self.history_scroll = QScrollArea()
+        self.history_scroll.setWidgetResizable(True)
+        self.history_content = QWidget()
+        self.history_list_layout = QVBoxLayout(self.history_content)
+        self.history_list_layout.setAlignment(Qt.AlignTop)
+        self.history_scroll.setWidget(self.history_content)
+        history_layout.addWidget(self.history_scroll, stretch=1)
+
+        self.btn_save_frame = QPushButton("4. Add Frame to List 💾")
+        self.btn_save_frame.setFixedHeight(40)
+        self.btn_save_frame.setObjectName("btnGreen")
+        self.btn_save_frame.clicked.connect(self.save_current_frame)
+        self.btn_save_frame.setEnabled(False)
+        history_layout.addWidget(self.btn_save_frame)
+
+        self.btn_export_excel = QPushButton("5. Export All to Excel 📊")
+        self.btn_export_excel.setFixedHeight(40)
+        self.btn_export_excel.setObjectName("btnGreen")
+        self.btn_export_excel.clicked.connect(self.export_to_excel)
+        history_layout.addWidget(self.btn_export_excel)
+
+        main_layout.addWidget(history_panel)
         main_scroll.setWidget(main_container)
         self.setCentralWidget(main_scroll)
+
+        self.resize(2000, 1200)
+        self.setMinimumSize(1400, 800)
 
     def group_and_align_centerlines(self, centerlines, tol_dist=150.0, tol_angle=1.5):
         v_lines, h_lines, d_lines = [], [], []
@@ -968,14 +1094,40 @@ class UltimateShipAnalyzer(QMainWindow):
         fname, _ = QFileDialog.getOpenFileName(self, 'Select DXF File', '', 'DXF files (*.dxf)')
         if not fname: return
         fname = os.path.abspath(os.path.normpath(fname))
+
         self.reset_analysis_data()
         self.result_box.clear()
         self.current_dxf_path = fname
 
-        self.table_thk.setRowCount(0)  # 기존 테이블 초기화
+        # ✨ 로딩 상태 설정 (중복 클릭 방지)
+        self.is_processing = True
+        self.btn_load.setEnabled(False)
+
+        # =============== ✨ [로딩 창 생성] ===============
+        progress = QProgressDialog("Starting DXF Load...", "Cancel", 0, 100, self)
+        progress.setWindowTitle("Loading DXF")
+        progress.setWindowModality(Qt.WindowModal)
+        progress.setAutoClose(True)
+        progress.setMinimumDuration(0)
+        progress.setValue(5)
+        progress.setStyleSheet("""
+            QProgressDialog { background-color: #F8F9FA; font-family: 'Malgun Gothic'; color: #2C3E50; }
+            QLabel { font-weight: bold; font-size: 13px; margin-bottom: 10px; }
+            QProgressBar { border: 1px solid #CED4DA; border-radius: 5px; text-align: center; color: #2C3E50; font-weight: bold; background-color: #FFFFFF; height: 15px; }
+            QProgressBar::chunk { background-color: #00AD1D; border-radius: 4px; }
+            QPushButton { background-color: #F1F3F5; color: black; font-weight: bold; border: 1px solid #CED4DA; border-radius: 5px; padding: 5px 20px; margin-top: 10px; }
+        """)
+        progress.show()
+        QApplication.processEvents()
+        # ===================================================
 
         try:
             scale = float(self.txt_scale.text())
+
+            progress.setLabelText("Reading DXF file format...")
+            progress.setValue(15)
+            QApplication.processEvents()
+
             try:
                 doc = ezdxf.readfile(fname, encoding='cp949')
             except:
@@ -983,6 +1135,10 @@ class UltimateShipAnalyzer(QMainWindow):
                     doc = ezdxf.readfile(fname, encoding='utf-8')
                 except:
                     doc = ezdxf.readfile(fname)
+
+            progress.setLabelText("Extracting internal layers...")
+            progress.setValue(30)
+            QApplication.processEvents()
 
             msp = doc.modelspace()
             active_layers = {l.dxf.name for l in doc.layers if l.is_on() and not l.is_frozen()}
@@ -1002,6 +1158,10 @@ class UltimateShipAnalyzer(QMainWindow):
                 elif layer in t_layers:
                     t_layers[layer].append(ls)
 
+            progress.setLabelText("Processing coordinate geometry...")
+            progress.setValue(50)
+            QApplication.processEvents()
+
             if t_1999:
                 u_1999 = unary_union(t_1999)
                 self.cx = u_1999.centroid.x
@@ -1012,23 +1172,15 @@ class UltimateShipAnalyzer(QMainWindow):
             shift = lambda ls: LineString([(p[0] - self.cx, p[1] - self.cy_base) for p in ls.coords])
 
             self.raw_1999_lines = [shift(ls) for ls in t_1999]
-            self.raw_1204_lines = [shift(ls) for ls in t_1204]  # 시각화용 컷터 저장
-
+            self.lines_minus1204 = [shift(ls) for ls in t_1204]
             m_1999 = unary_union(self.raw_1999_lines)
             self.hull_centroid = m_1999.centroid
 
-            cutters = []
-            for c in self.raw_1204_lines:
-                c_coords = list(c.coords)
-                p1, p2 = np.array(c_coords[0]), np.array(c_coords[-1])
-                v = p2 - p1
-                L = np.linalg.norm(v)
-                if L > 1e-6:
-                    u = v / L
-                    cutters.append(LineString([tuple(p1 - u * 1000), tuple(p2 + u * 1000)]))
+            cutters = [LineString([tuple(np.array(c.coords[0]) - 20), tuple(np.array(c.coords[-1]) + 20)])
+                       for c in [shift(ls) for ls in t_1204]]
 
             y_min, y_max = m_1999.bounds[1], m_1999.bounds[3]
-            center_cutter = LineString([(0, y_min - 2000), (0, y_max + 2000)])
+            center_cutter = LineString([(0, y_min - 100), (0, y_max + 100)])
             cutters.append(center_cutter)
 
             split_res = split(m_1999, unary_union(cutters)) if cutters else m_1999
@@ -1036,8 +1188,7 @@ class UltimateShipAnalyzer(QMainWindow):
 
             self.left_1999_segments = []
             for g in pieces:
-                # ✨ 핵심: 대칭 연산을 위해 x=0 기준 왼쪽 반단면만 필터링합니다. (약간의 공차 1.0 허용)
-                if g.length > 50.0 and g.centroid.x <= 1.0:
+                if g.centroid.x <= 0.5 and g.length > 100.0:
                     self.left_1999_segments.append(g)
 
             self.left_1999_segments.sort(key=lambda s: (-round(s.centroid.y, 2), s.centroid.x))
@@ -1045,32 +1196,65 @@ class UltimateShipAnalyzer(QMainWindow):
             self.lines_1102 = [shift(ls) for ls in t_layers["-1102"]]
             self.lines_1102_raw = list(self.lines_1102)
             self.lines_157 = [shift(ls) for ls in t_layers["157"]]
-
             self.lines_6001 = [shift(ls) for ls in t_layers["6001"]]
             self.lines_7001 = [shift(ls) for ls in t_layers["7001"]]
             self.lines_8001 = [shift(ls) for ls in t_layers["8001"]]
             self.lines_9001 = [shift(ls) for ls in t_layers["9001"]]
 
-            # ✨ 테이블에 피스 항목 채우기
-            self.table_thk.setRowCount(len(self.left_1999_segments))
-            for i, seg in enumerate(self.left_1999_segments):
-                y_mid = seg.centroid.y
-                item_desc = QTableWidgetItem(f"P{i + 1} (Y:{y_mid:,.0f})")
-                item_desc.setFlags(Qt.ItemIsSelectable | Qt.ItemIsEnabled)
-                item_desc.setBackground(QColor("#F8F9FA"))
-                self.table_thk.setItem(i, 0, item_desc)
+            progress.setLabelText("Generating Thickness UI Inputs...")
+            progress.setValue(70)
+            QApplication.processEvents()
 
-                item_thk = QTableWidgetItem("10.0")
-                item_thk.setTextAlignment(Qt.AlignCenter)
-                self.table_thk.setItem(i, 1, item_thk)
+            # ✨ UI 생성 로직도 로딩 프로세스 안에 포함!
+            if hasattr(self, 'left_1999_segments') and self.left_1999_segments:
+                for i in reversed(range(self.thickness_layout.count())):
+                    w = self.thickness_layout.itemAt(i).widget()
+                    if w: w.setParent(None)
+                self.shell_thickness_inputs.clear()
 
+                for i, l in enumerate(self.left_1999_segments):
+                    f = QFrame()
+                    r = QHBoxLayout(f)
+                    r.setContentsMargins(10, 5, 10, 5)
+                    f.setStyleSheet(
+                        "QFrame { background-color: #FFFFFF; border: 1px solid #CED4DA; border-radius: 6px; margin-bottom: 4px; }")
+
+                    lbl = QLabel(f"P{i + 1}:")
+                    lbl.setStyleSheet("font-weight: bold; color: #2C3E50; border: none; background: transparent;")
+                    r.addWidget(lbl)
+                    r.addStretch()
+
+                    edit = QLineEdit("")
+                    edit.setFixedWidth(getattr(self, 'field_width', 135))
+                    edit.setAlignment(Qt.AlignRight)
+                    r.addWidget(edit)
+
+                    self.thickness_layout.addWidget(f)
+                    self.shell_thickness_inputs.append(edit)
+
+                if self.shell_thickness_inputs:
+                    for i in range(len(self.shell_thickness_inputs) - 1):
+                        self.setTabOrder(self.shell_thickness_inputs[i], self.shell_thickness_inputs[i + 1])
+                    if hasattr(self, 'btn_calc'):
+                        self.setTabOrder(self.shell_thickness_inputs[-1], self.btn_calc)
+
+            progress.setLabelText("Rendering Preview (refresh_ui)...")
+            progress.setValue(85)
+            QApplication.processEvents()
+
+            # ✨ 대망의 도면 그리기 작업 (로딩창 85% 시점에서 실행)
             self.refresh_ui()
-            self.result_box.append(f"✅ Successfully loaded: {os.path.basename(fname)}\n"
-                                   f"👉 1. 좌측 도면에서 외판의 절단 상태 및 번호(P1, P2...)를 확인하세요.\n"
-                                   f"👉 2. 좌측 테이블에 각 반단면 외판 피스별 두께를 입력하세요.\n"
-                                   f"👉 3. 입력이 완료되면 [2. 1D 변환 및 정렬] 버튼을 눌러 계산을 진행합니다.")
+
+            progress.setValue(100)
+            self.result_box.append(f"✅ Successfully loaded: {os.path.basename(fname)}")
+
         except Exception as e:
             self.result_box.setText(f"❌ Load Error Detailed:\n{traceback.format_exc()}")
+        finally:
+            # ✨ 로딩 완료 시점에 무조건 프로그레스 창을 닫고 버튼 활성화 복구
+            progress.close()
+            self.is_processing = False
+            self.btn_load.setEnabled(True)
 
     def process_1d_geometry(self):
         if self.is_processing: return
@@ -1079,14 +1263,14 @@ class UltimateShipAnalyzer(QMainWindow):
             QMessageBox.warning(self, "경고", "처리할 1999 외판 부재가 없습니다. 먼저 DXF를 로드해주세요.")
             return
 
-        # ✨ 계산 시작 전, 테이블에서 입력된 외판 두께를 리스트로 읽어 들임
         segment_thicknesses = []
-        for i in range(self.table_thk.rowCount()):
-            try:
-                val = float(self.table_thk.item(i, 1).text())
-            except ValueError:
-                val = 10.0  # 숫자 형식이 아니면 기본값 10
-            segment_thicknesses.append(val)
+        if hasattr(self, 'left_1999_segments'):
+            for i, l_seg in enumerate(self.left_1999_segments):
+                try:
+                    t = float(self.shell_thickness_inputs[i].text())
+                except (ValueError, IndexError, AttributeError):
+                    t = 10.0
+                segment_thicknesses.append(t)
 
         self.is_processing = True
         self.btn_calc.setEnabled(False)
@@ -1096,6 +1280,15 @@ class UltimateShipAnalyzer(QMainWindow):
         progress.setWindowTitle("Processing...")
         progress.setWindowModality(Qt.WindowModal)
         progress.setAutoClose(True)
+        progress.setMinimumDuration(0)
+        progress.setValue(5)
+        progress.setStyleSheet("""
+                    QProgressDialog { background-color: #F8F9FA; font-family: 'Malgun Gothic'; color: #2C3E50; }
+                    QLabel { font-weight: bold; font-size: 13px; margin-bottom: 10px; }
+                    QProgressBar { border: 1px solid #CED4DA; border-radius: 5px; text-align: center; color: #2C3E50; font-weight: bold; background-color: #FFFFFF; height: 15px; }
+                    QProgressBar::chunk { background-color: #00AD1D; border-radius: 4px; }
+                    QPushButton { background-color: #F1F3F5; color: black; font-weight: bold; border: 1px solid #CED4DA; border-radius: 5px; padding: 5px 20px; margin-top: 10px; }
+                """)
         progress.show()
         QApplication.processEvents()
 
@@ -1715,7 +1908,7 @@ class UltimateShipAnalyzer(QMainWindow):
                 self.is_processing = False
                 self.btn_calc.setEnabled(True)
                 self.btn_load.setEnabled(True)
-                QMessageBox.warning(self, "입력 오류", "전단력(Total Vy)에는 유효한 숫자(t 단위)를 입력해야 합니다.\n계산을 중단합니다.")
+                QMessageBox.warning(self, "입력 오류", "전단력(Shear)에는 유효한 숫자(t 단위)를 입력해야 합니다.\n계산을 중단합니다.")
                 return
 
             progress.setLabelText("Calculating Determinate Shear Flow...")
@@ -1815,6 +2008,80 @@ class UltimateShipAnalyzer(QMainWindow):
                 f"{shear_ixx_text}"
             )
             self.result_box.setText(summary_text)
+
+            # =============== ✨ 여기에 3번 강도평가용 데이터 연산 코드 삽입 ===============
+            if hasattr(self, 'shear_calc_ixx_half'):
+                keep_box = box(-9999999.0, -9999999.0, getattr(self, 'x_cut', 0.0) + 0.5, 9999999.0)
+                all_y = []
+                for cl in all_cl:
+                    geom = cl['line'].intersection(keep_box)
+                    if geom.is_empty: continue
+                    geoms = [geom] if geom.geom_type == 'LineString' else list(
+                        geom.geoms) if geom.geom_type == 'MultiLineString' else []
+                    for g in geoms:
+                        all_y.extend([c[1] for c in g.coords])
+
+                y_max = max(all_y) if all_y else 0.0
+                y_min = min(all_y) if all_y else 0.0
+
+                na_y = self.shear_calc_na_y
+                ixx_full = self.shear_calc_ixx_full
+
+                dist_top = y_max - na_y
+                dist_btm = na_y - y_min
+
+                self.calc_depth = (y_max - y_min) * 1e-3
+                self.calc_z_top = (ixx_full / dist_top * 1e-9) if dist_top != 0 else 0
+                self.calc_z_btm = (ixx_full / dist_btm * 1e-9) if dist_btm != 0 else 0
+
+                try:
+                    self.raw_swbm = float(
+                        getattr(self, 'txt_swbm', QLineEdit("100000")).text().strip().replace(',', ''))
+                except ValueError:
+                    self.raw_swbm = 100000.0
+
+                try:
+                    self.raw_shear = float(self.txt_vy.text().strip().replace(',', ''))
+                except ValueError:
+                    self.raw_shear = 100.0
+
+                max_tau = 0.0
+                max_thk = 0.0
+                max_coord = (0, 0)
+                max_eid = -1
+
+                user_vy = getattr(self, 'user_Vy_total', 1000000.0)
+                for eid, sub_list in self.edge_q_results.items():
+                    thk = self.graph_edges[eid].get('thickness', 10.0)
+                    if thk < 0.1: thk = 0.1
+                    for chunk in sub_list:
+                        ts = chunk['q_start_unit'] * user_vy / thk
+                        te = chunk['q_end_unit'] * user_vy / thk
+                        if abs(ts) > max_tau:
+                            max_tau = abs(ts)
+                            max_thk = thk
+                            max_coord = (chunk['geom'].coords[0][0], chunk['geom'].coords[0][1])
+                            max_eid = eid
+                        if abs(te) > max_tau:
+                            max_tau = abs(te)
+                            max_thk = thk
+                            max_coord = (chunk['geom'].coords[-1][0], chunk['geom'].coords[-1][1])
+                            max_eid = eid
+
+                self.act_fs = max_tau
+                self.max_shell_thk = max_thk
+                self.max_mesh_coords = max_coord
+                self.max_shell_q_idx = max_eid
+
+                self.unit_q_val = (self.act_fs * self.max_shell_thk) / user_vy if user_vy > 0 else 0.0
+
+                z_act_top_mm3 = self.calc_z_top * 1e9 if self.calc_z_top > 0 else 1e-9
+                self.act_fb = (abs(self.raw_swbm) * 9.80665 * 1e6) / z_act_top_mm3
+
+            # 계산 완료 시 강도평가 버튼 활성화
+            if hasattr(self, 'btn_eval'):
+                self.btn_eval.setEnabled(True)
+            # =========================================================================
 
             self.is_calculated = True
             progress.setValue(100)
@@ -2658,6 +2925,8 @@ class UltimateShipAnalyzer(QMainWindow):
                 self.slit_dialog.show()
 
     def refresh_ui(self):
+        saved = [edit.text() for edit in getattr(self, 'shell_thickness_inputs', [])]
+
         if hasattr(self, 'cbar') and self.cbar is not None:
             try:
                 self.cbar.remove()
@@ -2670,7 +2939,6 @@ class UltimateShipAnalyzer(QMainWindow):
         ax1, ax2 = self.fig1.add_subplot(111), self.fig2.add_subplot(111)
 
         if self.is_calculated:
-            # 기존의 계산 완료 후 렌더링 로직 유지
             if hasattr(self, 'final_healed_centerlines'):
                 keep_box = box(-9999999.0, -9999999.0, getattr(self, 'x_cut', 0.0) + 0.5, 9999999.0)
                 for cl in self.final_healed_centerlines:
@@ -2700,14 +2968,6 @@ class UltimateShipAnalyzer(QMainWindow):
                             for cg in c_geoms: ax2.plot(*cg.xy, color='#D3D3D3', linewidth=2.0, alpha=0.9, zorder=4)
 
             if hasattr(self, 'graph_edges'):
-                if hasattr(self, 'cells_info') and self.cells_info:
-                    for cinfo in self.cells_info:
-                        poly, cid = cinfo['polygon'], cinfo['cell_id']
-                        ax2.annotate(f"Cell {cid}", (poly.centroid.x, poly.centroid.y), color='black', weight='bold',
-                                     fontsize=12,
-                                     ha='center', va='center', zorder=25,
-                                     bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="black", alpha=0.9, lw=1.5))
-
                 if hasattr(self, 'edge_q_results') and self.edge_q_results:
                     import matplotlib.colors as mcolors
                     import matplotlib.cm as cm
@@ -2796,10 +3056,18 @@ class UltimateShipAnalyzer(QMainWindow):
                             ax2.plot(*geom.xy, color='dodgerblue', linewidth=2.5, alpha=0.8, zorder=10, picker=5,
                                      gid=f"edge_{eid}")
 
-                        if 'mass_points' in edge_data:
-                            for mp in edge_data['mass_points']:
-                                ax2.scatter(mp['pt'][0], mp['pt'][1], color='darkgray', s=35, marker='o', zorder=35,
-                                            edgecolors='black')
+                    if hasattr(self, 'max_mesh_coords') and hasattr(self, 'act_fs') and getattr(self, 'act_fs', 0) > 0:
+                        mx, my = self.max_mesh_coords
+                        mx_display = -abs(mx)
+                        ax2.annotate(
+                            f"Max \u03c4: {self.act_fs:.2f} N/mm\u00b2\nthk: {self.max_shell_thk} mm",
+                            xy=(mx_display, my), xycoords='data',
+                            xytext=(40, 40), textcoords='offset points',
+                            arrowprops=dict(arrowstyle="->", color='red', lw=2.0, connectionstyle="arc3,rad=0.2"),
+                            color='red', fontsize=10, fontweight='bold', ha='left', va='bottom',
+                            bbox=dict(facecolor='white', alpha=0.8, edgecolor='red'),
+                            zorder=20
+                        )
 
                     cut_edge_ids = [c['edge_id'] for c in self.cut_edges_info] if hasattr(self,
                                                                                           'cut_edges_info') else []
@@ -2811,46 +3079,35 @@ class UltimateShipAnalyzer(QMainWindow):
                     sm = plt.cm.ScalarMappable(cmap=cmap, norm=norm)
                     sm.set_array([])
                     self.cbar = self.fig2.colorbar(sm, ax=ax2, fraction=0.046, pad=0.04)
-                    self.cbar.set_label(f'Signed Shear Stress τ_d (MPa)\n[Total Vy = {user_vy:,.0f} N 적용]',
+                    self.cbar.set_label(f'Signed Shear Stress \u03c4_d (MPa)\n[Total Vy = {user_vy:,.0f} N 적용]',
                                         fontweight='bold', fontsize=10)
 
                 node_xs, node_ys = [pt[0] for pt in self.graph_nodes.values()], [pt[1] for pt in
                                                                                  self.graph_nodes.values()]
-                ax2.scatter(node_xs, node_ys, color='red', s=40, zorder=20, edgecolors='black')
-
-                for nid, pt in self.graph_nodes.items():
-                    ax2.annotate(str(nid), (pt[0], pt[1]), xytext=(4, 4), textcoords='offset points', color='black',
-                                 fontsize=9, fontweight='bold', zorder=25)
-
-                if hasattr(self, 'flowchart_slit_nodes') and self.flowchart_slit_nodes:
-                    for i, nid in enumerate(self.flowchart_slit_nodes):
-                        if nid in self.graph_nodes:
-                            pt, label = self.graph_nodes[nid], 'Slit Position (Cut Node)' if i == 0 else ""
-                            ax2.scatter(pt[0], pt[1], color='lime', marker='*', s=250, zorder=30, edgecolors='black',
-                                        picker=5, gid=f"slit_{nid}", label=label)
-                    ax2.legend(loc='upper right')
-
+                ax2.scatter(node_xs, node_ys, color='grey', s=30, zorder=20, edgecolors='black')
         else:
-            # ✨ 2. DXF Load 직후 계산 전 프리뷰 모드 렌더링
+
             if hasattr(self, 'raw_1999_lines') and self.raw_1999_lines:
+
                 for ls in self.raw_1999_lines:
-                    ax1.plot(*ls.xy, color='#E0E0E0', lw=1.2, zorder=1)  # 뒷배경에 원본 외판 희미하게 표시
+                    ax1.plot(*ls.xy, color='#E0E0E0', lw=1.2, zorder=1)
+
+                    ax2.plot(*ls.xy, color='#E0E0E0', lw=1.2, zorder=1)
 
             if hasattr(self, 'raw_1204_lines') and self.raw_1204_lines:
                 for ls in self.raw_1204_lines:
-                    ax1.plot(*ls.xy, color='red', lw=2.0, linestyle='--', zorder=2)  # 컷팅 라인 빨간 점선
+                    ax1.plot(*ls.xy, color='red', lw=2.0, linestyle='--', zorder=2)
 
             if hasattr(self, 'left_1999_segments') and self.left_1999_segments:
-                import matplotlib.cm as cm
-                colors = cm.get_cmap('tab10')
+                import matplotlib as mpl
+                colors = mpl.colormaps['tab10']
                 for i, ls in enumerate(self.left_1999_segments):
                     c = colors(i % 10)
                     ax1.plot(*ls.xy, color=c, lw=3.5, zorder=5)
-                    # 원(bbox)을 제거하고 텍스트 색상을 검은색으로 변경
+                    # ✨ 여기가 핵심 복구 지점! (P1, P2 라벨링)
                     ax1.annotate(f"P{i + 1}", (ls.centroid.x, ls.centroid.y), color='black', weight='bold', fontsize=11,
                                  ha='center', va='center', zorder=10)
 
-            # ax2에는 내부 격벽 및 보강재 1D 변환 대기열 표시
             all_internal_raw = []
             if hasattr(self, 'lines_1102_raw'): all_internal_raw.extend(self.lines_1102_raw)
             if hasattr(self, 'lines_157'): all_internal_raw.extend(self.lines_157)
@@ -2862,8 +3119,41 @@ class UltimateShipAnalyzer(QMainWindow):
             for ls in all_internal_raw:
                 ax2.plot(*ls.xy, color='dodgerblue', lw=1.0, alpha=0.5, zorder=3)
 
-            ax1.set_title("[-1204 컷팅 및 반단면 외판 분할 프리뷰]", fontweight='bold')
-            ax2.set_title("[내부 부재 1D 변환 대기열]", fontweight='bold')
+            ax1.set_title("[S/SHELL Preview]", fontweight='bold')
+            ax2.set_title("[Filtering Queue]", fontweight='bold')
+
+        if hasattr(self, 'left_1999_segments') and self.left_1999_segments:
+            for i in reversed(range(self.thickness_layout.count())):
+                w = self.thickness_layout.itemAt(i).widget()
+                if w: w.setParent(None)
+            self.shell_thickness_inputs.clear()
+
+            for i, l in enumerate(self.left_1999_segments):
+                f = QFrame()
+                r = QHBoxLayout(f)
+                r.setContentsMargins(10, 5, 10, 5)
+                f.setStyleSheet(
+                    "QFrame { background-color: #FFFFFF; border: 1px solid #CED4DA; border-radius: 6px; margin-bottom: 4px; }")
+
+                y_mid, x_mid = l.centroid.y, l.centroid.x
+                lbl = QLabel(f"P{i + 1}")
+                lbl.setStyleSheet("font-weight: bold; color: #2C3E50; border: none; background: transparent;")
+                r.addWidget(lbl)
+                r.addStretch()
+
+                edit = QLineEdit(saved[i] if i < len(saved) else "")
+                edit.setFixedWidth(getattr(self, 'field_width', 135))
+                edit.setAlignment(Qt.AlignRight)
+                r.addWidget(edit)
+
+                self.thickness_layout.addWidget(f)
+                self.shell_thickness_inputs.append(edit)
+
+            if self.shell_thickness_inputs:
+                for i in range(len(self.shell_thickness_inputs) - 1):
+                    self.setTabOrder(self.shell_thickness_inputs[i], self.shell_thickness_inputs[i + 1])
+                if hasattr(self, 'btn_calc'):
+                    self.setTabOrder(self.shell_thickness_inputs[-1], self.btn_calc)
 
         for ax in [ax1, ax2]:
             ax.set_aspect('equal')
@@ -2890,6 +3180,329 @@ class UltimateShipAnalyzer(QMainWindow):
         self.matrix_dialog = MatrixViewerDialog(self)
         self.matrix_dialog.setWindowModality(Qt.NonModal)
         self.matrix_dialog.show()
+
+    def evaluate_strength(self):
+        if not self.is_calculated: return
+        k = float(self.txt_grade_k.text())
+        self.allow_fs = 105 / k
+        if self.combo_section.currentText() == "Continuous":
+            self.allow_fb = 143 / k
+        else:
+            h_t = self.combo_hull.currentText()
+            m_t = self.combo_material_type.currentText()
+            table = {"S/H": {"Mild": 60, "H.T": 75, "H.T with BKT 450": 105, "H.T with BKT 850": 112},
+                     "D/H": {"Mild": 112, "H.T": 150, "H.T with BKT 450": 157, "H.T with BKT 850": 157}}
+            self.allow_fb = table.get(h_t, {}).get(m_t, 60)
+
+        final_res = self.result_box.toPlainText() + "\n\n--- Strength Check & Utilization ---\n"
+        final_res += f"Material         : {self.combo_material_type.currentText()}\n\n"
+        fb_util = (self.act_fb / self.allow_fb) * 100 if self.allow_fb > 0 else 0
+        fs_util = (self.act_fs / self.allow_fs) * 100 if self.allow_fs > 0 else 0
+
+        final_res += f"Bending Stress   : {self.act_fb:.2f} / {self.allow_fb:.2f} N/mm2 ({fb_util:.1f}%) [{'PASS' if self.act_fb <= self.allow_fb else 'FAIL'}]\n"
+        final_res += f"Shear Stress     : {self.act_fs:.2f} / {self.allow_fs:.2f} N/mm2 ({fs_util:.1f}%) [{'PASS' if self.act_fs <= self.allow_fs else 'FAIL'}]\n"
+
+        if fb_util > 80 or fs_util > 80:
+            high_stress_types = []
+            if fb_util > 80: high_stress_types.append("Bending")
+            if fs_util > 80: high_stress_types.append("Shear")
+            stress_str = " & ".join(high_stress_types)
+            final_res += f"\n⚠️ WARNING: {stress_str} stress utilization is highly concentrated (up to 80%).\n"
+            final_res += "   Additional structural reinforcement (e.g., brackets) is recommended.\n"
+        else:
+            final_res += f"\n✅ Both bending and shear stress are within allowable limits.\n"
+
+        self.result_box.setText(final_res)
+        self.btn_save_frame.setEnabled(True)
+
+    def save_current_frame(self):
+        frame_name, ok = QInputDialog.getText(self, "Save Frame", "Enter Frame Name:",
+                                              QLineEdit.EchoMode.Normal, "FR.")
+        if not ok or not frame_name.strip(): return
+        img_sec = io.BytesIO()
+        self.fig1.savefig(img_sec, format='png', bbox_inches='tight', dpi=150)
+        img_shr = io.BytesIO()
+        self.fig2.savefig(img_shr, format='png', bbox_inches='tight', dpi=150)
+        data = {
+            "Frame": frame_name.strip(), "SWBM": self.raw_swbm, "Depth": round(self.calc_depth, 2),
+            "NA": round(self.calc_na_bl * 1e-3, 2), "Ixx": round(self.shear_calc_ixx_full * 1e-12, 2),
+            "Grade_K": float(self.txt_grade_k.text()),
+            "Z_btm": round(self.calc_z_btm, 2), "Z_top": round(self.calc_z_top, 2),
+            "Act_FB": round(self.act_fb, 1), "Allow_FB": round(self.allow_fb, 1),
+            "Shear": self.raw_shear,
+            "Pos_Shear": f"Edge_{self.max_shell_q_idx}" if self.max_shell_q_idx != -1 else "N/A",
+            "Thk": self.max_shell_thk, "Unit_q": self.unit_q_val,
+            "Act_FS": round(self.act_fs, 1), "Allow_FS": round(self.allow_fs, 1),
+            "ImgSec": img_sec.getvalue(), "ImgShr": img_shr.getvalue()
+        }
+        self.saved_frames_data.append(data)
+        self.update_history_list_ui()
+
+    def update_history_list_ui(self):
+        for i in reversed(range(self.history_list_layout.count())):
+            w = self.history_list_layout.itemAt(i).widget()
+            if w: w.deleteLater()
+        for i, data in enumerate(self.saved_frames_data):
+            f = QFrame()
+            f.setStyleSheet("background: white; border: 1px solid #BDC3C7; border-radius: 4px; margin-bottom: 2px;")
+            l = QHBoxLayout(f)
+            l.setContentsMargins(5, 5, 5, 5)
+            lbl_name = QLabel(f"📝 {data['Frame']}")
+            lbl_name.setStyleSheet("font-weight:bold; border:none;")
+            l.addWidget(lbl_name)
+            l.addStretch()
+            btn_edit = QPushButton("✏️")
+            btn_edit.setFixedSize(24, 24)
+            btn_edit.setStyleSheet("border: none; background: transparent;")
+            btn_edit.clicked.connect(lambda chk=False, idx=i: self.rename_frame(idx))
+            l.addWidget(btn_edit)
+            btn_up = QPushButton("⬆️")
+            btn_up.setFixedSize(24, 24)
+            btn_up.setStyleSheet("border: none; background: transparent;")
+            btn_up.setEnabled(i > 0)
+            btn_up.clicked.connect(lambda chk=False, idx=i: self.move_frame_up(idx))
+            l.addWidget(btn_up)
+            btn_down = QPushButton("⬇️")
+            btn_down.setFixedSize(24, 24)
+            btn_down.setStyleSheet("border: none; background: transparent;")
+            btn_down.setEnabled(i < len(self.saved_frames_data) - 1)
+            btn_down.clicked.connect(lambda chk=False, idx=i: self.move_frame_down(idx))
+            l.addWidget(btn_down)
+            btn_del = QPushButton("❌")
+            btn_del.setFixedSize(24, 24)
+            btn_del.setStyleSheet("border: none; background: transparent;")
+            btn_del.clicked.connect(lambda chk=False, idx=i: self.delete_saved_frame(idx))
+            l.addWidget(btn_del)
+            self.history_list_layout.addWidget(f)
+
+    def rename_frame(self, idx):
+        old = self.saved_frames_data[idx]['Frame']
+        n, ok = QInputDialog.getText(self, "Rename", "Frame Name:", QLineEdit.Normal, old)
+        if ok and n.strip():
+            self.saved_frames_data[idx]['Frame'] = n.strip()
+            self.update_history_list_ui()
+
+    def move_frame_up(self, idx):
+        if idx > 0:
+            self.saved_frames_data[idx - 1], self.saved_frames_data[idx] = \
+                self.saved_frames_data[idx], self.saved_frames_data[idx - 1]
+            self.update_history_list_ui()
+
+    def move_frame_down(self, idx):
+        if idx < len(self.saved_frames_data) - 1:
+            self.saved_frames_data[idx + 1], self.saved_frames_data[idx] = \
+                self.saved_frames_data[idx], self.saved_frames_data[idx + 1]
+            self.update_history_list_ui()
+
+    def delete_saved_frame(self, index):
+        if 0 <= index < len(self.saved_frames_data):
+            del self.saved_frames_data[index]
+            self.update_history_list_ui()
+
+    def apply_outer_border(self, ws, min_r, max_r, min_c, max_c):
+        from openpyxl.styles import Border, Side
+        thick = Side(border_style="medium", color="000000")
+        for r in range(min_r, max_r + 1):
+            for c in range(min_c, max_c + 1):
+                cell = ws.cell(row=r, column=c)
+                b = cell.border
+                cell.border = Border(top=thick if r == min_r else b.top,
+                                     bottom=thick if r == max_r else b.bottom,
+                                     left=thick if c == min_c else b.left,
+                                     right=thick if c == max_c else b.right)
+
+    def export_to_excel(self):
+        if not self.saved_frames_data: return
+        path, _ = QFileDialog.getSaveFileName(self, "Export to Excel", "Section_Analysis_Report.xlsx",
+                                              "Excel Files (*.xlsx)")
+        if not path: return
+        try:
+            from openpyxl import Workbook
+            from openpyxl.styles import Alignment, Font, PatternFill, Border, Side
+            from openpyxl.utils import get_column_letter
+            from openpyxl.drawing.image import Image as XlImage
+            from openpyxl.worksheet.pagebreak import Break
+            wb = Workbook()
+            ws = wb.active
+            ws.title = "Strength Result"
+            f_title = Font(name='돋움', size=14, bold=True, underline='double')
+            f_11b = Font(name='돋움', size=11, bold=True)
+            f_11n = Font(name='돋움', size=11)
+            f_10n = Font(name='돋움', size=10)
+            f_18b = Font(name='돋움', size=18, bold=True)
+            a_c = Alignment(horizontal='center', vertical='center', wrap_text=True)
+            fill_y = PatternFill(start_color='FFF2CC', end_color='FFF2CC', fill_type='solid')
+            fill_g = PatternFill(start_color='E2EFDA', end_color='E2EFDA', fill_type='solid')
+            thin_s = Side(border_style="thin", color="000000")
+            b_all = Border(top=thin_s, left=thin_s, right=thin_s, bottom=thin_s)
+
+            ws.merge_cells('A1:I4')
+            ws.cell(1, 1, "HHI-FAIVE Conclusion of Scantling Check").font = f_title
+            ws.cell(1, 1).alignment = a_c
+            ws.merge_cells('J1:J4')
+            ws.cell(1, 10, "검 토").alignment = a_c
+            ws.cell(1, 11, "PART장").alignment = a_c
+            ws.cell(1, 12, "보임과장").alignment = a_c
+            ws.merge_cells('K2:K3')
+            ws.merge_cells('L2:L3')
+            ws.row_dimensions[2].height = ws.row_dimensions[3].height = 30
+            today = datetime.datetime.now().strftime("%Y.%m.%d.")
+            ws.cell(4, 11, today).alignment = a_c
+            ws.cell(4, 12, today).alignment = a_c
+            for r in range(1, 5):
+                for c in range(1, 13): ws.cell(r, c).border = b_all
+
+            ws.cell(5, 1, "*Allowable stress").font = f_11b
+            ws.merge_cells('A6:A8')
+            ws.cell(6, 1, "Bending Stress")
+            ws.merge_cells('B6:C6')
+            ws.cell(6, 2, "Continuous Section")
+            ws.merge_cells('D6:L6')
+            ws.cell(6, 4, "143/k for bending stress")
+            ws.merge_cells('B7:C8')
+            ws.cell(7, 2, "Discontinuous Section")
+            ws.merge_cells('D7:F7')
+            ws.cell(7, 4, "60 N/mm² for S/H (Mild)")
+            ws.merge_cells('G7:I7')
+            ws.cell(7, 7, "75 N/mm² for S/H (H.T)")
+            ws.merge_cells('J7:L7')
+            ws.cell(7, 10, "112 N/mm² for S/H (H.T with BKT)")
+            ws.merge_cells('D8:F8')
+            ws.cell(8, 4, "112 N/mm² for D/H (Mild)")
+            ws.merge_cells('G8:I8')
+            ws.cell(8, 7, "150 N/mm² for D/H (H.T)")
+            ws.merge_cells('J8:L8')
+            ws.cell(8, 10, "157 N/mm² for D/H (H.T with BKT)")
+            ws.merge_cells('A9:C9')
+            ws.cell(9, 1, "Shear Stress")
+            ws.merge_cells('D9:L9')
+            ws.cell(9, 4, "105/k for shear stress")
+            for r in range(6, 10):
+                for c in range(1, 13):
+                    ws.cell(r, c).border = b_all
+                    ws.cell(r, c).alignment = a_c
+
+            row_idx = 11
+            for data in self.saved_frames_data:
+                headers = ["Position", "S.W.B.M\n( t·m )", "Depth(m)", "Position of\nN.A from B.L(m)",
+                           "Inertia(m⁴)", "Grade (k)", "Zact_at btm\n(m³)", "Zact_at top\n(m³)",
+                           "Bending stress_at top\n(N/mm²)", "Allowable stress\n(N/mm²)",
+                           "Percentage\n(%)", "Result"]
+                for i, h in enumerate(headers, 1):
+                    cell = ws.cell(row_idx, i, h)
+                    cell.alignment = a_c
+                    cell.font = f_10n
+                    cell.border = b_all
+
+                r2 = [data['Frame'], data['SWBM'], data['Depth'], data['NA'], data['Ixx'],
+                      data['Grade_K'], data['Z_btm'], data['Z_top'], data['Act_FB'], data['Allow_FB'],
+                      data['Act_FB'] / data['Allow_FB'] if data['Allow_FB'] > 0 else 0,
+                      "OK" if data['Act_FB'] <= data['Allow_FB'] else "NG"]
+                for i, v in enumerate(r2, 1):
+                    cell = ws.cell(row_idx + 1, i, v)
+                    cell.alignment = a_c
+                    cell.border = b_all
+                    cell.font = f_11n
+                    if i in [2, 3, 4, 5, 6]: cell.fill = fill_y
+                    if i in [9, 10, 11]: cell.fill = fill_g
+                    if i == 2:
+                        cell.number_format = '#,##0'
+                    elif i == 6:
+                        cell.number_format = '0.00'
+                    elif i == 11:
+                        cell.number_format = '0%'
+                    elif i in [3, 4, 5, 7, 8]:
+                        cell.number_format = '#,##0.00'
+
+                ws.cell(row_idx + 2, 2, "SHEAR ( t )").alignment = a_c
+                ws.merge_cells(start_row=row_idx + 2, start_column=3, end_row=row_idx + 2, end_column=4)
+                ws.cell(row_idx + 2, 3, "Position").alignment = a_c
+                ws.cell(row_idx + 2, 5, "Thickness\n( mm )").alignment = a_c
+                ws.cell(row_idx + 2, 6, "Grade (k)").alignment = a_c
+                ws.merge_cells(start_row=row_idx + 2, start_column=7, end_row=row_idx + 2, end_column=8)
+                ws.cell(row_idx + 2, 7, "Shear flow\n(N/mm) for unit load").alignment = a_c
+                ws.cell(row_idx + 2, 9, "Shear stress\n(N/mm²)").alignment = a_c
+                ws.cell(row_idx + 2, 10, "Allowable stress\n(N/mm²)").alignment = a_c
+                ws.cell(row_idx + 2, 11, "Percentage\n(%)").alignment = a_c
+                ws.cell(row_idx + 2, 12, "Result").alignment = a_c
+                r4 = [data['Shear'], data['Pos_Shear'], data['Thk'], data['Grade_K'],
+                      data['Unit_q'], data['Act_FS'], data['Allow_FS'],
+                      data['Act_FS'] / data['Allow_FS'] if data['Allow_FS'] > 0 else 0,
+                      "OK" if data['Act_FS'] <= data['Allow_FS'] else "NG"]
+
+                ws.cell(row_idx + 3, 2, r4[0]).fill = fill_y
+                ws.cell(row_idx + 3, 2).number_format = '#,##0'
+                ws.merge_cells(start_row=row_idx + 3, start_column=3, end_row=row_idx + 3, end_column=4)
+                ws.cell(row_idx + 3, 3, r4[1])
+                ws.cell(row_idx + 3, 5, r4[2]).fill = fill_y
+                ws.cell(row_idx + 3, 6, r4[3]).fill = fill_y
+                ws.cell(row_idx + 3, 6).number_format = '0.00'
+                ws.merge_cells(start_row=row_idx + 3, start_column=7, end_row=row_idx + 3, end_column=8)
+                ws.cell(row_idx + 3, 7, r4[4]).fill = fill_y
+                ws.cell(row_idx + 3, 7).number_format = '0.00E+00'
+                ws.cell(row_idx + 3, 9, r4[5]).fill = fill_g
+                ws.cell(row_idx + 3, 10, r4[6]).fill = fill_g
+                ws.cell(row_idx + 3, 11, r4[7]).fill = fill_g
+                ws.cell(row_idx + 3, 11).number_format = '0%'
+                ws.cell(row_idx + 3, 12, r4[8])
+
+                for r in range(row_idx + 2, row_idx + 4):
+                    for c in range(2, 13):
+                        ws.cell(r, c).border = b_all
+                        ws.cell(r, c).alignment = a_c
+                        ws.cell(r, c).font = f_11n
+
+                ws.merge_cells(start_row=row_idx + 1, start_column=1, end_row=row_idx + 3, end_column=1)
+                ws.cell(row_idx + 1, 1).border = b_all
+                ws.cell(row_idx + 2, 1).border = b_all
+                ws.cell(row_idx + 3, 1).border = b_all
+                ws.cell(row_idx + 1, 1).font = f_11b
+                row_idx += 4
+
+            self.apply_outer_border(ws, 1, row_idx - 1, 1, 12)
+            for i, w in enumerate([14, 13, 10, 16, 13, 10, 12, 12, 18, 16, 12, 12], 1):
+                ws.column_dimensions[get_column_letter(i)].width = w
+            ws.page_setup.orientation = ws.ORIENTATION_PORTRAIT
+            ws.page_setup.fitToPage = True
+            ws.page_setup.fitToWidth = 1
+            ws.page_setup.fitToHeight = 0
+            ws.sheet_view.view = 'pageBreakPreview'
+            ws.print_area = f"A1:L{row_idx - 1}"
+            ws.page_setup.paperSize = ws.PAPERSIZE_A4
+            ws.page_margins.left = 0.3
+            ws.page_margins.right = 0.3
+            ws.print_options.horizontalCentered = True
+
+            ws_v = wb.create_sheet(title="Visualizations")
+            ws_v.sheet_view.view = 'pageBreakPreview'
+            ws_v.page_setup.orientation = ws_v.ORIENTATION_LANDSCAPE
+            ws_v.page_setup.fitToPage = True
+            ws_v.page_setup.fitToWidth = 0
+            ws_v.page_setup.fitToHeight = 1
+            col_pos = 2
+            for d in self.saved_frames_data:
+                ws_v.cell(2, col_pos, f"Results: {d['Frame']}").font = f_18b
+                im1 = XlImage(io.BytesIO(d['ImgSec']))
+                im1.width, im1.height = int(im1.width * 0.5), int(im1.height * 0.5)
+                ws_v.add_image(im1, ws_v.cell(4, col_pos).coordinate)
+                im2 = XlImage(io.BytesIO(d['ImgShr']))
+                im2.width, im2.height = int(im2.width * 0.5), int(im2.height * 0.5)
+                ws_v.add_image(im2, ws_v.cell(22, col_pos).coordinate)
+                current_page_num = (col_pos - 2) // 8 + 1
+                ws_v.col_breaks.append(Break(id=current_page_num * 8))
+                col_pos += 8
+            ws_v.print_area = f"A1:{get_column_letter(col_pos - 1)}40"
+            for i in range(1, col_pos):
+                ws_v.column_dimensions[get_column_letter(i)].width = 9
+
+            wb.save(path)
+            QMessageBox.information(self, "Success", "Export Done!")
+
+        except PermissionError:
+            QMessageBox.critical(self, "Error (Errno 13)",
+                                 "The file is currently open in Excel.\nPlease close it and try again.")
+        except Exception as e:
+            QMessageBox.critical(self, "Error", str(e))
 
 
 if __name__ == "__main__":
