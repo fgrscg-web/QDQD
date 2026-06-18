@@ -611,6 +611,7 @@ class UltimateShipAnalyzer(QMainWindow):
         self.resize(1800, 1000)
         self.current_dxf_path = ""
         self.is_processing = False
+        self.saved_frames_data = []
         self.reset_analysis_data()
         self.init_ui()
 
@@ -642,7 +643,9 @@ class UltimateShipAnalyzer(QMainWindow):
         self.flowchart_slit_nodes = []
         self.shell_thickness_inputs = []
 
-        self.saved_frames_data = []
+        # 🔥 절대 이 위치에 self.saved_frames_data = [] 를 넣지 마세요!
+        # (넣게 되면 계산을 새로 할 때마다 저장해둔 프레임 목록이 다 날아갑니다)
+
         self.act_fb = 0.0
         self.act_fs = 0.0
         self.allow_fb = 0.0
@@ -1901,7 +1904,7 @@ class UltimateShipAnalyzer(QMainWindow):
             self.execute_flowchart_algorithm()
 
             try:
-                Vy_input_t = float(self.txt_vy.text().strip())
+                Vy_input_t = float(self.txt_vy.text().strip().replace(',', ''))
                 Vy_input_N = Vy_input_t * 9806.65
             except ValueError:
                 progress.close()
@@ -2057,15 +2060,15 @@ class UltimateShipAnalyzer(QMainWindow):
                     for chunk in sub_list:
                         ts = chunk['q_start_unit'] * user_vy / thk
                         te = chunk['q_end_unit'] * user_vy / thk
-                        if abs(ts) > max_tau:
-                            max_tau = abs(ts)
+
+                        # ✨ 수정된 부분: 부재 끝점이 아닌 중앙 좌표를 구하여 저장
+                        max_val = max(abs(ts), abs(te))
+                        if max_val > max_tau:
+                            max_tau = max_val
                             max_thk = thk
-                            max_coord = (chunk['geom'].coords[0][0], chunk['geom'].coords[0][1])
-                            max_eid = eid
-                        if abs(te) > max_tau:
-                            max_tau = abs(te)
-                            max_thk = thk
-                            max_coord = (chunk['geom'].coords[-1][0], chunk['geom'].coords[-1][1])
+                            # 선분의 50% 지점(정중앙) 좌표를 추출합니다.
+                            pt_mid = chunk['geom'].interpolate(0.5, normalized=True)
+                            max_coord = (pt_mid.x, pt_mid.y)
                             max_eid = eid
 
                 self.act_fs = max_tau
@@ -2899,6 +2902,13 @@ class UltimateShipAnalyzer(QMainWindow):
                     thk = edge['thickness']
                     tau_s_actual, tau_e_actual = q_s_actual / thk, q_e_actual / thk
 
+                    # ✨ 전단응력 계산 요약 텍스트 추가
+                    avg_tau = (abs(tau_s_actual) + abs(tau_e_actual)) / 2.0
+                    info_text += f"\n📊 [전단응력(Shear Stress) 정보]\n"
+                    info_text += f" - 시작점 전단응력 : {tau_s_actual:.2f} MPa\n"
+                    info_text += f" - 끝점 전단응력   : {tau_e_actual:.2f} MPa\n"
+                    info_text += f" - 국소 평균 응력   : {avg_tau:.2f} MPa\n"
+
                     if hasattr(self, 'edge_to_cells') and edge_id in self.edge_to_cells:
                         belonging_cells = self.edge_to_cells[edge_id]
                         if len(belonging_cells) == 0:
@@ -3059,7 +3069,9 @@ class UltimateShipAnalyzer(QMainWindow):
                     if hasattr(self, 'max_mesh_coords') and hasattr(self, 'act_fs') and getattr(self, 'act_fs', 0) > 0:
                         mx, my = self.max_mesh_coords
                         mx_display = -abs(mx)
-                        ax2.annotate(
+
+                        # ✨ 수정된 부분: ax2.annotate 결과를 probe 변수에 담습니다.
+                        probe = ax2.annotate(
                             f"Max \u03c4: {self.act_fs:.2f} N/mm\u00b2\nthk: {self.max_shell_thk} mm",
                             xy=(mx_display, my), xycoords='data',
                             xytext=(40, 40), textcoords='offset points',
@@ -3068,6 +3080,9 @@ class UltimateShipAnalyzer(QMainWindow):
                             bbox=dict(facecolor='white', alpha=0.8, edgecolor='red'),
                             zorder=20
                         )
+
+                        # ✨ 수정된 부분: set_draggable(True) 대신 draggable(True) 사용
+                        probe.draggable(True)
 
                     cut_edge_ids = [c['edge_id'] for c in self.cut_edges_info] if hasattr(self,
                                                                                           'cut_edges_info') else []
@@ -3183,6 +3198,26 @@ class UltimateShipAnalyzer(QMainWindow):
 
     def evaluate_strength(self):
         if not self.is_calculated: return
+
+        # ✨ 1. 현재 텍스트박스에 사용자가 입력한 하중 값을 즉시 다시 읽어오기
+        try:
+            self.raw_swbm = float(self.txt_swbm.text().strip().replace(',', ''))
+        except ValueError:
+            self.raw_swbm = 100000.0
+
+        try:
+            self.raw_shear = float(self.txt_vy.text().strip().replace(',', ''))
+        except ValueError:
+            self.raw_shear = 100.0
+
+        # ✨ 2. 갱신된 하중을 바탕으로 Bending & Shear 응력 재계산
+        z_act_top_mm3 = self.calc_z_top * 1e9 if self.calc_z_top > 0 else 1e-9
+        self.act_fb = (abs(self.raw_swbm) * 9.80665 * 1e6) / z_act_top_mm3
+
+        if hasattr(self, 'unit_q_val') and self.max_shell_thk > 0:
+            new_vy_n = self.raw_shear * 9806.65
+            self.act_fs = (self.unit_q_val * new_vy_n) / self.max_shell_thk
+
         k = float(self.txt_grade_k.text())
         self.allow_fs = 105 / k
         if self.combo_section.currentText() == "Continuous":
@@ -3216,25 +3251,68 @@ class UltimateShipAnalyzer(QMainWindow):
         self.btn_save_frame.setEnabled(True)
 
     def save_current_frame(self):
-        frame_name, ok = QInputDialog.getText(self, "Save Frame", "Enter Frame Name:",
-                                              QLineEdit.EchoMode.Normal, "FR.")
+        import re
+        import io
+
+        # 🔥 1. 저장 버튼 누르는 즉시 화면 텍스트박스 값을 강제로 새로 읽어오기
+        try:
+            swbm_text = getattr(self, 'txt_swbm').text().strip().replace(',', '')
+            swbm_num = re.sub(r'[^\d\.\-\+]', '', swbm_text)
+            current_swbm = float(swbm_num) if swbm_num else 100000.0
+        except:
+            current_swbm = 100000.0
+
+        try:
+            vy_text = getattr(self, 'txt_vy').text().strip().replace(',', '')
+            vy_num = re.sub(r'[^\d\.\-\+]', '', vy_text)
+            current_shear = float(vy_num) if vy_num else 100.0
+        except:
+            current_shear = 100.0
+
+        # 🔥 2. 새로 읽어온 힘(current_swbm, current_shear)으로 응력을 그 자리에서 재계산
+        current_act_fb = 0.0
+        current_act_fs = 0.0
+
+        if getattr(self, 'is_calculated', False):
+            z_act_top_mm3 = self.calc_z_top * 1e9 if self.calc_z_top > 0 else 1e-9
+            current_act_fb = (abs(current_swbm) * 9.80665 * 1e6) / z_act_top_mm3
+
+            if hasattr(self, 'unit_q_val') and getattr(self, 'max_shell_thk', 0) > 0:
+                current_act_fs = (self.unit_q_val * current_shear * 9806.65) / self.max_shell_thk
+
+        frame_name, ok = QInputDialog.getText(self, "Save Frame", "Enter Frame Name:", QLineEdit.EchoMode.Normal, "FR.")
         if not ok or not frame_name.strip(): return
+
         img_sec = io.BytesIO()
         self.fig1.savefig(img_sec, format='png', bbox_inches='tight', dpi=150)
         img_shr = io.BytesIO()
         self.fig2.savefig(img_shr, format='png', bbox_inches='tight', dpi=150)
+
+        # 🔥 3. 새로 계산된 실시간 값(LIVE)만 딕셔너리에 담기
         data = {
-            "Frame": frame_name.strip(), "SWBM": self.raw_swbm, "Depth": round(self.calc_depth, 2),
-            "NA": round(self.calc_na_bl * 1e-3, 2), "Ixx": round(self.shear_calc_ixx_full * 1e-12, 2),
-            "Grade_K": float(self.txt_grade_k.text()),
-            "Z_btm": round(self.calc_z_btm, 2), "Z_top": round(self.calc_z_top, 2),
-            "Act_FB": round(self.act_fb, 1), "Allow_FB": round(self.allow_fb, 1),
-            "Shear": self.raw_shear,
-            "Pos_Shear": f"Edge_{self.max_shell_q_idx}" if self.max_shell_q_idx != -1 else "N/A",
-            "Thk": self.max_shell_thk, "Unit_q": self.unit_q_val,
-            "Act_FS": round(self.act_fs, 1), "Allow_FS": round(self.allow_fs, 1),
-            "ImgSec": img_sec.getvalue(), "ImgShr": img_shr.getvalue()
+            "Frame": frame_name.strip(),
+            "SWBM": current_swbm,
+            "Depth": round(getattr(self, 'calc_depth', 0.0), 2),
+            "NA": round(getattr(self, 'calc_na_bl', 0.0) * 1e-3, 2),
+            "Ixx": round(getattr(self, 'shear_calc_ixx_full', 0.0) * 1e-12, 2),
+            "Grade_K": float(self.txt_grade_k.text()) if self.txt_grade_k.text() else 1.0,
+            "Z_btm": round(getattr(self, 'calc_z_btm', 0.0), 2),
+            "Z_top": round(getattr(self, 'calc_z_top', 0.0), 2),
+            "Act_FB": round(current_act_fb, 1),
+            "Allow_FB": round(getattr(self, 'allow_fb', 143.0), 1),
+            "Shear": current_shear,
+            "Pos_Shear": f"Edge_{self.max_shell_q_idx}" if getattr(self, 'max_shell_q_idx', -1) != -1 else "N/A",
+            "Thk": getattr(self, 'max_shell_thk', 0.0),
+            "Unit_q": getattr(self, 'unit_q_val', 0.0),
+            "Act_FS": round(current_act_fs, 1),
+            "Allow_FS": round(getattr(self, 'allow_fs', 105.0), 1),
+            "ImgSec": img_sec.getvalue(),
+            "ImgShr": img_shr.getvalue()
         }
+
+        # 리스트에 추가하고 UI 갱신
+        if not hasattr(self, 'saved_frames_data'):
+            self.saved_frames_data = []
         self.saved_frames_data.append(data)
         self.update_history_list_ui()
 
@@ -3312,19 +3390,26 @@ class UltimateShipAnalyzer(QMainWindow):
                                      right=thick if c == max_c else b.right)
 
     def export_to_excel(self):
-        if not self.saved_frames_data: return
+        if not hasattr(self, 'saved_frames_data') or not self.saved_frames_data:
+            QMessageBox.warning(self, "알림", "출력할 프레임 데이터가 없습니다.")
+            return
+
         path, _ = QFileDialog.getSaveFileName(self, "Export to Excel", "Section_Analysis_Report.xlsx",
                                               "Excel Files (*.xlsx)")
         if not path: return
+
         try:
+            import io
             from openpyxl import Workbook
             from openpyxl.styles import Alignment, Font, PatternFill, Border, Side
             from openpyxl.utils import get_column_letter
             from openpyxl.drawing.image import Image as XlImage
             from openpyxl.worksheet.pagebreak import Break
+
             wb = Workbook()
             ws = wb.active
             ws.title = "Strength Result"
+
             f_title = Font(name='돋움', size=14, bold=True, underline='double')
             f_11b = Font(name='돋움', size=11, bold=True)
             f_11n = Font(name='돋움', size=11)
@@ -3336,6 +3421,7 @@ class UltimateShipAnalyzer(QMainWindow):
             thin_s = Side(border_style="thin", color="000000")
             b_all = Border(top=thin_s, left=thin_s, right=thin_s, bottom=thin_s)
 
+            # --- 상단 공통 정보 작성 ---
             ws.merge_cells('A1:I4')
             ws.cell(1, 1, "HHI-FAIVE Conclusion of Scantling Check").font = f_title
             ws.cell(1, 1).alignment = a_c
@@ -3346,6 +3432,7 @@ class UltimateShipAnalyzer(QMainWindow):
             ws.merge_cells('K2:K3')
             ws.merge_cells('L2:L3')
             ws.row_dimensions[2].height = ws.row_dimensions[3].height = 30
+            import datetime
             today = datetime.datetime.now().strftime("%Y.%m.%d.")
             ws.cell(4, 11, today).alignment = a_c
             ws.cell(4, 12, today).alignment = a_c
@@ -3382,6 +3469,11 @@ class UltimateShipAnalyzer(QMainWindow):
                     ws.cell(r, c).border = b_all
                     ws.cell(r, c).alignment = a_c
 
+            self.apply_outer_border(ws, 1, 4, 1, 12)
+            self.apply_outer_border(ws, 6, 9, 1, 12)
+            # ------------------------
+
+            # 🔥 여러 개의 결과를 엑셀 표로 독립적으로 쌓는 핵심 루프
             row_idx = 11
             for data in self.saved_frames_data:
                 headers = ["Position", "S.W.B.M\n( t·m )", "Depth(m)", "Position of\nN.A from B.L(m)",
@@ -3398,6 +3490,7 @@ class UltimateShipAnalyzer(QMainWindow):
                       data['Grade_K'], data['Z_btm'], data['Z_top'], data['Act_FB'], data['Allow_FB'],
                       data['Act_FB'] / data['Allow_FB'] if data['Allow_FB'] > 0 else 0,
                       "OK" if data['Act_FB'] <= data['Allow_FB'] else "NG"]
+
                 for i, v in enumerate(r2, 1):
                     cell = ws.cell(row_idx + 1, i, v)
                     cell.alignment = a_c
@@ -3425,6 +3518,7 @@ class UltimateShipAnalyzer(QMainWindow):
                 ws.cell(row_idx + 2, 10, "Allowable stress\n(N/mm²)").alignment = a_c
                 ws.cell(row_idx + 2, 11, "Percentage\n(%)").alignment = a_c
                 ws.cell(row_idx + 2, 12, "Result").alignment = a_c
+
                 r4 = [data['Shear'], data['Pos_Shear'], data['Thk'], data['Grade_K'],
                       data['Unit_q'], data['Act_FS'], data['Allow_FS'],
                       data['Act_FS'] / data['Allow_FS'] if data['Allow_FS'] > 0 else 0,
@@ -3457,11 +3551,15 @@ class UltimateShipAnalyzer(QMainWindow):
                 ws.cell(row_idx + 2, 1).border = b_all
                 ws.cell(row_idx + 3, 1).border = b_all
                 ws.cell(row_idx + 1, 1).font = f_11b
+
+                # 하나의 표가 끝날 때마다 굵은 바깥 테두리 씌우기
+                self.apply_outer_border(ws, row_idx, row_idx + 3, 1, 12)
+
                 row_idx += 4
 
-            self.apply_outer_border(ws, 1, row_idx - 1, 1, 12)
             for i, w in enumerate([14, 13, 10, 16, 13, 10, 12, 12, 18, 16, 12, 12], 1):
                 ws.column_dimensions[get_column_letter(i)].width = w
+
             ws.page_setup.orientation = ws.ORIENTATION_PORTRAIT
             ws.page_setup.fitToPage = True
             ws.page_setup.fitToWidth = 1
@@ -3473,6 +3571,7 @@ class UltimateShipAnalyzer(QMainWindow):
             ws.page_margins.right = 0.3
             ws.print_options.horizontalCentered = True
 
+            # --- 이미지 탭 (기존과 동일) ---
             ws_v = wb.create_sheet(title="Visualizations")
             ws_v.sheet_view.view = 'pageBreakPreview'
             ws_v.page_setup.orientation = ws_v.ORIENTATION_LANDSCAPE
@@ -3480,17 +3579,21 @@ class UltimateShipAnalyzer(QMainWindow):
             ws_v.page_setup.fitToWidth = 0
             ws_v.page_setup.fitToHeight = 1
             col_pos = 2
+
             for d in self.saved_frames_data:
                 ws_v.cell(2, col_pos, f"Results: {d['Frame']}").font = f_18b
                 im1 = XlImage(io.BytesIO(d['ImgSec']))
                 im1.width, im1.height = int(im1.width * 0.5), int(im1.height * 0.5)
                 ws_v.add_image(im1, ws_v.cell(4, col_pos).coordinate)
+
                 im2 = XlImage(io.BytesIO(d['ImgShr']))
                 im2.width, im2.height = int(im2.width * 0.5), int(im2.height * 0.5)
                 ws_v.add_image(im2, ws_v.cell(22, col_pos).coordinate)
+
                 current_page_num = (col_pos - 2) // 8 + 1
                 ws_v.col_breaks.append(Break(id=current_page_num * 8))
                 col_pos += 8
+
             ws_v.print_area = f"A1:{get_column_letter(col_pos - 1)}40"
             for i in range(1, col_pos):
                 ws_v.column_dimensions[get_column_letter(i)].width = 9
